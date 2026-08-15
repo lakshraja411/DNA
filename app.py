@@ -19,7 +19,7 @@ from splitter_core import (
 )
 
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 
 
 # ============================================================
@@ -1550,41 +1550,111 @@ def main() -> None:
             # AVAILABLE Y METRICS
             # ------------------------------------------------
 
-            y_options = {
+            # ------------------------------------------------
+            # Y-AXIS SOURCE
+            # ------------------------------------------------
+            #
+            # The event_fitting file gives segment-derived ΔI values.
+            # The dataset.npz file also contains the reduced event feature
+            # matrix X.  For this dataset, X[:,0] is used as the default
+            # dataset ΔI feature.  The column remains user-selectable so the
+            # app is robust to other NanoSense dataset layouts.
+            # ------------------------------------------------
 
-                "Peak segment ΔI (from event_fitting)":
+            y_source = st.selectbox(
+                "Y-axis source",
+                [
+                    "ΔI from dataset.npz",
+                    "Peak segment ΔI from event_fitting",
+                    "Time-weighted segment ΔI from event_fitting",
+                    "Number of segments from event_fitting",
+                    "Other raw dataset column",
+                ],
+                index=0,
+                help=(
+                    "Use dataset.npz if you want the same reduced-event ΔI "
+                    "feature stored in the NanoSense dataset. "
+                    "event_fitting options calculate ΔI from fitted segments."
+                ),
+            )
+
+            if y_source == "ΔI from dataset.npz":
+
+                dataset_delta_i_col = st.selectbox(
+                    "dataset.npz ΔI column",
+                    options=list(range(X.shape[1])),
+                    index=0,
+                    format_func=lambda j: f"X[:, {j}]",
+                    help=(
+                        "Default is X[:,0] for the uploaded dataset. "
+                        "This is adjustable because dataset feature layouts "
+                        "can vary between analysis/software versions."
+                    ),
+                )
+
+                y_name = (
+                    f"ΔI from dataset.npz "
+                    f"(X[:, {dataset_delta_i_col}])"
+                )
+
+                y_values = np.asarray(
+                    X[:, dataset_delta_i_col],
+                    dtype=float,
+                )
+
+            elif y_source == "Peak segment ΔI from event_fitting":
+
+                y_name = "Peak segment ΔI (from event_fitting)"
+
+                y_values = np.asarray(
                     derived_metrics[
                         "Peak segment ΔI"
                     ],
+                    dtype=float,
+                )
 
-                "Time-weighted segment ΔI (from event_fitting)":
+            elif y_source == "Time-weighted segment ΔI from event_fitting":
+
+                y_name = "Time-weighted segment ΔI (from event_fitting)"
+
+                y_values = np.asarray(
                     derived_metrics[
                         "Time-weighted segment ΔI"
                     ],
+                    dtype=float,
+                )
 
-                "Number of segments (from event_fitting)":
+            elif y_source == "Number of segments from event_fitting":
+
+                y_name = "Number of segments (from event_fitting)"
+
+                y_values = np.asarray(
                     derived_metrics[
                         "Number of segments"
                     ],
-            }
+                    dtype=float,
+                )
 
-            # ------------------------------------------------
-            # ADD ALL RAW DATASET COLUMNS
-            # ------------------------------------------------
+            else:
 
-            for j in range(
-                X.shape[1]
-            ):
+                raw_columns = [
+                    j
+                    for j in range(X.shape[1])
+                    if j != 4
+                ]
 
-                # X[:,4] = dwell time,
-                # already used on the x-axis
+                raw_col = st.selectbox(
+                    "Raw dataset column",
+                    options=raw_columns,
+                    format_func=lambda j: f"X[:, {j}]",
+                )
 
-                if j == 4:
-                    continue
+                y_name = f"Raw dataset X[:, {raw_col}]"
 
-                y_options[
-                    f"Raw dataset X[:, {j}]"
-                ] = X[:, j]
+                y_values = np.asarray(
+                    X[:, raw_col],
+                    dtype=float,
+                )
 
             controls_a, controls_b = st.columns(
                 2
@@ -1595,14 +1665,6 @@ def main() -> None:
             # ------------------------------------------------
 
             with controls_a:
-
-                y_name = st.selectbox(
-                    "Y-axis metric",
-                    options=list(
-                        y_options.keys()
-                    ),
-                    index=0,
-                )
 
                 population_view = st.radio(
                     "Population",
@@ -1657,17 +1719,6 @@ def main() -> None:
                         "peak are hidden to give the glowing density-map look."
                     ),
                 )
-
-            # ------------------------------------------------
-            # GET Y VALUES
-            # ------------------------------------------------
-
-            y_values = np.asarray(
-                y_options[
-                    y_name
-                ],
-                dtype=float,
-            )
 
             # ------------------------------------------------
             # POPULATION SELECTION
