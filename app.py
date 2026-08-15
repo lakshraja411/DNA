@@ -19,7 +19,7 @@ from splitter_core import (
 )
 
 
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.4"
 
 
 # ============================================================
@@ -1314,31 +1314,83 @@ def main() -> None:
 
             else:
 
-                default_width = float(
-                    max(
-                        dwell_resolution_ms,
-                        0.001,
-                    )
-                )
-
-                bin_width_ms = st.number_input(
-                    "Histogram bin width (ms)",
-                    min_value=0.001,
-                    value=default_width,
-                    step=default_width,
-                    format="%.5f",
-                    key="hist_bin_width",
+                bin_control = st.radio(
+                    "Histogram bin control",
+                    [
+                        "Number of bins",
+                        "Bin width (ms)",
+                    ],
+                    index=0,
+                    horizontal=True,
+                    key="hist_bin_control",
                     help=(
-                        "For short events, use a bin width close to the "
-                        "dwell-time sampling resolution. This avoids artificial "
-                        "gaps caused by using too many narrow bins."
+                        "Choose the total number of histogram bins directly, "
+                        "or specify an exact dwell-time bin width in milliseconds."
                     ),
                 )
 
-                bins = linear_histogram_edges(
-                    hist_values,
-                    bin_width_ms,
-                )
+                if bin_control == "Number of bins":
+
+                    n_bins = st.slider(
+                        "Number of bins",
+                        min_value=10,
+                        max_value=200,
+                        value=50,
+                        step=5,
+                        key="hist_n_bins",
+                    )
+
+                    finite_hist_values = np.asarray(
+                        hist_values,
+                        dtype=float,
+                    )
+
+                    finite_hist_values = finite_hist_values[
+                        np.isfinite(
+                            finite_hist_values
+                        )
+                    ]
+
+                    if len(finite_hist_values) == 0:
+
+                        st.warning(
+                            "No finite dwell times are available "
+                            "for this histogram."
+                        )
+
+                        st.stop()
+
+                    bins = np.histogram_bin_edges(
+                        finite_hist_values,
+                        bins=int(n_bins),
+                    )
+
+                else:
+
+                    default_width = float(
+                        max(
+                            dwell_resolution_ms,
+                            0.001,
+                        )
+                    )
+
+                    bin_width_ms = st.number_input(
+                        "Histogram bin width (ms)",
+                        min_value=0.001,
+                        value=default_width,
+                        step=default_width,
+                        format="%.5f",
+                        key="hist_bin_width",
+                        help=(
+                            "This sets the physical dwell-time width "
+                            "of every histogram bin."
+                        ),
+                    )
+
+                    bins = linear_histogram_edges(
+                        hist_values,
+                        bin_width_ms,
+                    )
 
                 if hist_view == "Short + Long overlay":
 
@@ -1411,10 +1463,10 @@ def main() -> None:
 
             if not log_axis:
                 st.caption(
-                    "The linear histogram uses a physical bin width rather "
-                    "than a fixed number of bins. This is especially important "
-                    "for very short events, whose dwell times are quantized by "
-                    "the acquisition sampling interval."
+                    "For linear histograms you can now choose either the "
+                    "**number of bins** directly or an exact **bin width (ms)**. "
+                    "The same bin edges are used for Short/Long overlays so the "
+                    "two populations remain directly comparable."
                 )
 
         # ====================================================
@@ -1617,8 +1669,8 @@ def main() -> None:
 
             st.caption(
                 "Smooth 2D Gaussian KDE of dwell time versus the selected "
-                "event metric. Linear dwell time is the default to reproduce "
-                "the classic glowing ΔI–Δt density-map appearance."
+                "event metric. Linear dwell time is the default for the classic "
+                "glowing ΔI–Δt density-map appearance."
             )
 
             # ------------------------------------------------
@@ -1731,6 +1783,90 @@ def main() -> None:
                     dtype=float,
                 )
 
+            # ------------------------------------------------
+            # ΔI DISPLAY UNITS
+            # ------------------------------------------------
+            #
+            # For this NanoSense dataset, ΔI-like values are stored on an
+            # nA-scale.  The user can display them either in nA or pA.
+            # Conversion changes only the plotted units.
+            # ------------------------------------------------
+
+            if (
+                y_source == "ΔI from dataset.npz"
+                or y_source == "Peak segment ΔI from event_fitting"
+                or y_source == "Time-weighted segment ΔI from event_fitting"
+            ):
+
+                delta_i_unit = st.radio(
+                    "ΔI display unit",
+                    [
+                        "pA",
+                        "nA",
+                    ],
+                    index=0,
+                    horizontal=True,
+                    key="density_delta_i_unit",
+                    help=(
+                        "The underlying ΔI values are treated as nA-scale. "
+                        "Choosing pA multiplies the plotted values by 1000."
+                    ),
+                )
+
+                if delta_i_unit == "pA":
+
+                    y_values = (
+                        np.asarray(
+                            y_values,
+                            dtype=float,
+                        )
+                        * 1000.0
+                    )
+
+                    if "dataset.npz" in y_name:
+
+                        y_name = (
+                            "ΔI from dataset.npz "
+                            f"(X[:, {dataset_delta_i_col}]) (pA)"
+                        )
+
+                    elif "Peak segment" in y_name:
+
+                        y_name = (
+                            "Peak segment ΔI "
+                            "(from event_fitting) (pA)"
+                        )
+
+                    else:
+
+                        y_name = (
+                            "Time-weighted segment ΔI "
+                            "(from event_fitting) (pA)"
+                        )
+
+                else:
+
+                    if "dataset.npz" in y_name:
+
+                        y_name = (
+                            "ΔI from dataset.npz "
+                            f"(X[:, {dataset_delta_i_col}]) (nA)"
+                        )
+
+                    elif "Peak segment" in y_name:
+
+                        y_name = (
+                            "Peak segment ΔI "
+                            "(from event_fitting) (nA)"
+                        )
+
+                    else:
+
+                        y_name = (
+                            "Time-weighted segment ΔI "
+                            "(from event_fitting) (nA)"
+                        )
+
             controls_a, controls_b = st.columns(
                 2
             )
@@ -1749,6 +1885,13 @@ def main() -> None:
                         "Long",
                     ],
                     horizontal=True,
+                )
+
+                st.caption(
+                    "Population selection controls the KDE itself: "
+                    "**Short** fits only short events, **Long** fits only long "
+                    "events, and **All** fits all events. Axis limits change only "
+                    "the displayed view."
                 )
 
             # ------------------------------------------------
@@ -1931,7 +2074,40 @@ def main() -> None:
                     ]
 
                 # --------------------------------------------
-                # TRUE 2D KDE
+                # AXIS CONTROLS
+                # --------------------------------------------
+                #
+                # IMPORTANT:
+                # Population selection determines which events are used
+                # to fit the KDE:
+                #
+                #   All   -> all selected events
+                #   Short -> dwell <= cutoff
+                #   Long  -> dwell > cutoff
+                #
+                # The axis limits below affect only what is displayed.
+                # They never change which events are used to fit the KDE.
+                # --------------------------------------------
+
+                density_x_default = (
+                    float(np.min(x_plot)),
+                    float(np.max(x_plot)),
+                )
+
+                density_y_default = (
+                    float(np.min(y_plot)),
+                    float(np.max(y_plot)),
+                )
+
+                density_x_range, density_y_range = axis_limit_controls(
+                    "density2d",
+                    density_x_default,
+                    density_y_default,
+                    log_x=log_axis,
+                )
+
+                # --------------------------------------------
+                # TRUE 2D KDE OF THE SELECTED POPULATION
                 # --------------------------------------------
 
                 x_grid, y_grid, density = true_2d_kde_density(
@@ -1940,6 +2116,8 @@ def main() -> None:
                     log_x=log_axis,
                     grid_size=grid_size,
                     bandwidth_scale=kde_bandwidth_scale,
+                    x_percentiles=(0.2, 99.8),
+                    y_percentiles=(0.2, 99.8),
                 )
 
                 if density is None:
@@ -2062,16 +2240,6 @@ def main() -> None:
 
                     fig.tight_layout()
 
-                    density_x_default = ax.get_xlim()
-                    density_y_default = ax.get_ylim()
-
-                    density_x_range, density_y_range = axis_limit_controls(
-                        "density2d",
-                        density_x_default,
-                        density_y_default,
-                        log_x=log_axis,
-                    )
-
                     apply_axis_limits(
                         ax,
                         density_x_range,
@@ -2084,11 +2252,11 @@ def main() -> None:
                     )
 
                     st.caption(
-                        f"Showing **{len(x_plot):,}** finite events. "
-                        "The dashed line is the same dwell-time cutoff "
-                        "used for SHORT/LONG export. KDE smoothing and "
-                        "display limits affect only the density visualization, "
-                        "not the underlying events or population assignment."
+                        f"The KDE was fitted using **{len(x_plot):,}** events "
+                        f"from the **{population_view}** population. "
+                        "The dashed line is the dwell-time cutoff used for "
+                        "SHORT/LONG export. Axis limits and KDE smoothing affect "
+                        "only the visualization."
                     )
 
                     inspect_events = st.toggle(
@@ -2096,7 +2264,7 @@ def main() -> None:
                         value=False,
                         key="density_event_inspector",
                         help=(
-                            "Keeps the smooth density plot above unchanged. "
+                            "Keeps the smooth KDE plot above unchanged. "
                             "Turn this on only when you want to hover over "
                             "individual events and read their coordinates."
                         ),
