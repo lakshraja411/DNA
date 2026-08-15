@@ -7,7 +7,6 @@ import matplotlib.pyplot as plt
 import streamlit as st
 import plotly.graph_objects as go
 from sklearn.neighbors import KernelDensity
-from scipy.ndimage import gaussian_filter
 
 from splitter_core import (
     auto_cutoff_gmm,
@@ -19,7 +18,7 @@ from splitter_core import (
 )
 
 
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.3.0"
 
 
 # ============================================================
@@ -434,20 +433,46 @@ def linear_histogram_edges(values: np.ndarray, bin_width_ms: float) -> np.ndarra
     return edges
 
 
-def smooth_2d_hist_density(
+@st.cache_data(show_spinner=False)
+def true_2d_kde_density(
     x: np.ndarray,
     y: np.ndarray,
     log_x: bool = True,
-    grid_size: int = 180,
-    smoothing_sigma: float = 2.0,
+    grid_size: int = 160,
+    bandwidth: float = 0.18,
     x_percentiles: tuple[float, float] = (0.5, 99.5),
 ):
     """
-    Build a fast smooth 2D density field.
+    Estimate a genuine 2D Gaussian kernel density p(x, y).
 
-    A 2D histogram is calculated first and then Gaussian-smoothed. This gives
-    the continuous glowing density-map appearance while remaining fast enough
-    for thousands of nanopore events in Streamlit.
+    For nanopore data, dwell time is optionally transformed to log10 space
+    before KDE fitting because dwell-time distributions are strongly skewed.
+
+    Both axes are standardized before fitting. This prevents the numerical
+    scale of ΔI from dominating the dwell-time dimension (or vice versa).
+
+    Parameters
+    ----------
+    x
+        Dwell time in ms.
+    y
+        Selected event metric, e.g. ΔI.
+    log_x
+        If True, fit KDE in log10(dwell time).
+    grid_size
+        Number of evaluation points along each axis.
+    bandwidth
+        Gaussian KDE bandwidth in standardized 2D coordinates.
+        Smaller values preserve finer structure; larger values give a
+        smoother density field.
+    x_percentiles
+        Robust x-range used for density evaluation. This avoids a handful
+        of extreme dwell-time outliers stretching the entire KDE grid.
+
+    Returns
+    -------
+    x_grid, y_grid, density
+        1D display coordinates and a 2D KDE density array.
     """
 
     x = np.asarray(x, dtype=float)
@@ -464,27 +489,34 @@ def smooth_2d_hist_density(
     if len(x) < 5:
         return None, None, None
 
+    # --------------------------------------------------------
+    # Transform dwell time
+    # --------------------------------------------------------
+
     if log_x:
         x_work = np.log10(x)
     else:
         x_work = x.copy()
 
-    x_low, x_high = np.percentile(x_work, x_percentiles)
-    y_low, y_high = float(np.min(y)), float(np.max(y))
+    # --------------------------------------------------------
+    # Robust x-range for the displayed density field
+    # --------------------------------------------------------
 
-    if not np.isfinite(x_low) or not np.isfinite(x_high) or x_low >= x_high:
+    x_low, x_high = np.percentile(
+        x_work,
+        x_percentiles,
+    )
+
+    if (
+        not np.isfinite(x_low)
+        or not np.isfinite(x_high)
+        or x_low >= x_high
+    ):
         return None, None, None
-
-    if not np.isfinite(y_low) or not np.isfinite(y_high) or y_low >= y_high:
-        pad = 0.5 if y_low == y_high else 0.0
-        y_low -= pad
-        y_high += pad
 
     keep = (
         (x_work >= x_low)
         & (x_work <= x_high)
-        & (y >= y_low)
-        & (y <= y_high)
     )
 
     x_work = x_work[keep]
@@ -493,23 +525,122 @@ def smooth_2d_hist_density(
     if len(x_work) < 5:
         return None, None, None
 
-    density, x_edges, y_edges = np.histogram2d(
-        x_work,
-        y,
-        bins=int(grid_size),
-        range=[[x_low, x_high], [y_low, y_high]],
+    y_low = float(np.min(y))
+    y_high = float(np.max(y))
+
+    if (
+        not np.isfinite(y_low)
+        or not np.isfinite(y_high)
+    ):
+        return None, None, None
+
+    if y_low >= y_high:
+        pad = 0.5 if y_low == y_high else 0.0
+        y_low -= pad
+        y_high += pad
+
+    # --------------------------------------------------------
+    # Standardize x and y before fitting
+    # --------------------------------------------------------
+
+    x_mean = float(np.mean(x_work))
+    x_std = float(np.std(x_work))
+
+    y_mean = float(np.mean(y))
+    y_std = float(np.std(y))
+
+    if not np.isfinite(x_std) or x_std <= 0:
+        x_std = 1.0
+
+    if not np.isfinite(y_std) or y_std <= 0:
+        y_std = 1.0
+
+    x_scaled = (
+        x_work - x_mean
+    ) / x_std
+
+    y_scaled = (
+        y - y_mean
+    ) / y_std
+
+    samples = np.column_stack(
+        [
+            x_scaled,
+            y_scaled,
+        ]
     )
 
-    density = gaussian_filter(
-        density.T,
-        sigma=float(smoothing_sigma),
-        mode="nearest",
+    # --------------------------------------------------------
+    # Fit genuine 2D Gaussian KDE
+    # --------------------------------------------------------
+
+    kde = KernelDensity(
+        kernel="gaussian",
+        bandwidth=float(bandwidth),
+        algorithm="ball_tree",
+        rtol=1e-4,
     )
+
+    kde.fit(samples)
+
+    # --------------------------------------------------------
+    # Evaluation grid
+    # --------------------------------------------------------
+
+    x_grid_work = np.linspace(
+        x_low,
+        x_high,
+        int(grid_size),
+    )
+
+    y_grid = np.linspace(
+        y_low,
+        y_high,
+        int(grid_size),
+    )
+
+    GX, GY = np.meshgrid(
+        x_grid_work,
+        y_grid,
+    )
+
+    grid_samples = np.column_stack(
+        [
+            (
+                GX.ravel()
+                - x_mean
+            ) / x_std,
+            (
+                GY.ravel()
+                - y_mean
+            ) / y_std,
+        ]
+    )
+
+    log_density = kde.score_samples(
+        grid_samples
+    )
+
+    density = np.exp(
+        log_density
+    ).reshape(
+        GX.shape
+    )
+
+    # --------------------------------------------------------
+    # Convert x coordinates back to milliseconds for display
+    # --------------------------------------------------------
 
     if log_x:
-        x_edges = 10 ** x_edges
+        x_grid = 10 ** x_grid_work
+    else:
+        x_grid = x_grid_work
 
-    return x_edges, y_edges, density
+    return (
+        x_grid,
+        y_grid,
+        density,
+    )
 
 
 
@@ -1542,8 +1673,9 @@ def main() -> None:
         elif plot_type == "2D event density":
 
             st.caption(
-                "Dwell time is on the x-axis. The density field is "
-                "Gaussian-smoothed to give a continuous population map."
+                "Dwell time is on the x-axis. The colour field is a genuine "
+                "2D Gaussian kernel density estimate (KDE), not a smoothed "
+                "histogram."
             )
 
             # ------------------------------------------------
@@ -1696,15 +1828,17 @@ def main() -> None:
                     step=20,
                 )
 
-                smoothing_sigma = st.slider(
-                    "Density smoothing",
-                    min_value=0.5,
-                    max_value=6.0,
-                    value=2.0,
-                    step=0.25,
+                kde_bandwidth = st.slider(
+                    "2D KDE bandwidth",
+                    min_value=0.05,
+                    max_value=0.50,
+                    value=0.18,
+                    step=0.01,
                     help=(
-                        "Higher values make the population cloud smoother. "
-                        "This changes only the visualization, not the event split."
+                        "Bandwidth is applied after standardizing log-dwell "
+                        "time and the selected Y metric. Lower values preserve "
+                        "finer structure; higher values give a smoother KDE. "
+                        "This changes only the density visualization."
                     ),
                 )
 
@@ -1850,15 +1984,15 @@ def main() -> None:
                     ]
 
                 # --------------------------------------------
-                # SMOOTH 2D DENSITY
+                # TRUE 2D KDE
                 # --------------------------------------------
 
-                x_edges, y_edges, density = smooth_2d_hist_density(
+                x_grid, y_grid, density = true_2d_kde_density(
                     x_plot,
                     y_plot,
                     log_x=log_axis,
                     grid_size=grid_size,
-                    smoothing_sigma=smoothing_sigma,
+                    bandwidth=kde_bandwidth,
                 )
 
                 if density is None:
@@ -1896,8 +2030,8 @@ def main() -> None:
                     )
 
                     mesh = ax.pcolormesh(
-                        x_edges,
-                        y_edges,
+                        x_grid,
+                        y_grid,
                         density_masked,
                         shading="auto",
                         cmap="magma",
@@ -1932,7 +2066,7 @@ def main() -> None:
                     )
 
                     cbar.set_label(
-                        "Smoothed event density",
+                        "2D KDE density",
                         color="white",
                     )
 
@@ -2005,8 +2139,9 @@ def main() -> None:
                     st.caption(
                         f"Showing **{len(x_plot):,}** finite events. "
                         "The dashed line is the same dwell-time cutoff "
-                        "used for SHORT/LONG export. Smoothing affects "
-                        "only the plot, not the underlying event data."
+                        "used for SHORT/LONG export. The KDE bandwidth "
+                        "changes only the density visualization, not the "
+                        "underlying event data or population assignment."
                     )
 
                     inspect_events = st.toggle(
