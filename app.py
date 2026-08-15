@@ -18,7 +18,7 @@ from splitter_core import (
 )
 
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 
 # ============================================================
@@ -517,133 +517,181 @@ def smooth_2d_hist_density(
 # ============================================================
 
 
-def _finite_range(values: np.ndarray, positive_only: bool = False) -> tuple[float, float]:
-    """Return a safe finite min/max range for Streamlit axis controls."""
+PLOTLY_CONFIG = {
+    "displaylogo": False,
+    "scrollZoom": True,
+    "responsive": True,
+    "modeBarButtonsToRemove": [
+        "select2d",
+        "lasso2d",
+    ],
+}
 
+
+def finite_values(values: np.ndarray, positive_only: bool = False) -> np.ndarray:
+    """Return finite numeric values, optionally keeping only positive values."""
     values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
+    mask = np.isfinite(values)
 
     if positive_only:
-        values = values[values > 0]
+        mask &= values > 0
 
-    if len(values) == 0:
-        return (0.001, 1.0) if positive_only else (0.0, 1.0)
-
-    low = float(np.min(values))
-    high = float(np.max(values))
-
-    if np.isclose(low, high):
-        pad = max(abs(low) * 0.05, 1e-6)
-        low -= pad
-        high += pad
-
-        if positive_only:
-            low = max(low, np.finfo(float).tiny)
-
-    return low, high
+    return values[mask]
 
 
-def axis_range_controls(
-    prefix: str,
+def manual_axis_controls(
+    key_prefix: str,
     x_values: np.ndarray,
     y_values: np.ndarray | None = None,
+    *,
     log_x: bool = False,
 ):
     """
-    Streamlit controls for optional manual axis limits.
+    Optional manual X/Y axis limits.
 
-    Plotly itself still provides drag zoom, pan, autoscale and reset. These
-    controls are useful when an exact numerical viewing range is required.
+    These limits change only the displayed plot. They never alter the
+    short/long classification or the exported events.
     """
 
-    x_low, x_high = _finite_range(x_values, positive_only=log_x)
+    x_clean = finite_values(x_values, positive_only=log_x)
+
+    if len(x_clean) == 0:
+        return None, None
+
+    x_default_min = float(np.min(x_clean))
+    x_default_max = float(np.max(x_clean))
+
+    if np.isclose(x_default_min, x_default_max):
+        pad = abs(x_default_min) * 0.05 or 1.0
+        x_default_min -= pad
+        x_default_max += pad
 
     x_range = None
     y_range = None
 
-    with st.expander("Axis range / zoom controls", expanded=False):
+    with st.expander("Set axis limits / zoom", expanded=False):
+
         st.caption(
-            "You can also zoom directly on the graph: drag a box to zoom, "
-            "scroll to zoom, pan, or use the Plotly toolbar to reset/autoscale."
+            "These controls only change the view. "
+            "You can also drag to zoom, scroll to zoom, pan, or reset the axes "
+            "directly on the graph."
         )
 
         set_x = st.checkbox(
-            "Set exact X-axis range",
+            "Set custom X-axis limits",
             value=False,
-            key=f"{prefix}_set_x_range",
+            key=f"{key_prefix}_set_x",
         )
 
         if set_x:
-            col_x1, col_x2 = st.columns(2)
 
-            with col_x1:
+            xa, xb = st.columns(2)
+
+            x_step = max(
+                abs(x_default_max - x_default_min) / 200.0,
+                1e-6,
+            )
+
+            with xa:
                 x_min = st.number_input(
                     "X minimum",
-                    value=float(x_low),
-                    format="%.6g",
-                    key=f"{prefix}_x_min",
+                    value=x_default_min,
+                    step=x_step,
+                    format="%.6f",
+                    key=f"{key_prefix}_x_min",
                 )
 
-            with col_x2:
+            with xb:
                 x_max = st.number_input(
                     "X maximum",
-                    value=float(x_high),
-                    format="%.6g",
-                    key=f"{prefix}_x_max",
+                    value=x_default_max,
+                    step=x_step,
+                    format="%.6f",
+                    key=f"{key_prefix}_x_max",
                 )
 
-            if log_x and (x_min <= 0 or x_max <= 0):
-                st.warning("For a logarithmic X-axis, both limits must be > 0.")
+            if log_x and x_min <= 0:
+                st.warning(
+                    "For a logarithmic X-axis, X minimum must be greater than zero."
+                )
+
             elif x_min >= x_max:
                 st.warning("X minimum must be smaller than X maximum.")
+
             else:
                 x_range = (float(x_min), float(x_max))
 
         if y_values is not None:
-            y_low, y_high = _finite_range(y_values, positive_only=False)
 
-            set_y = st.checkbox(
-                "Set exact Y-axis range",
-                value=False,
-                key=f"{prefix}_set_y_range",
-            )
+            y_clean = finite_values(y_values)
 
-            if set_y:
-                col_y1, col_y2 = st.columns(2)
+            if len(y_clean):
 
-                with col_y1:
-                    y_min = st.number_input(
-                        "Y minimum",
-                        value=float(y_low),
-                        format="%.6g",
-                        key=f"{prefix}_y_min",
+                y_default_min = float(np.min(y_clean))
+                y_default_max = float(np.max(y_clean))
+
+                if np.isclose(y_default_min, y_default_max):
+                    pad = abs(y_default_min) * 0.05 or 1.0
+                    y_default_min -= pad
+                    y_default_max += pad
+
+                set_y = st.checkbox(
+                    "Set custom Y-axis limits",
+                    value=False,
+                    key=f"{key_prefix}_set_y",
+                )
+
+                if set_y:
+
+                    ya, yb = st.columns(2)
+
+                    y_step = max(
+                        abs(y_default_max - y_default_min) / 200.0,
+                        1e-6,
                     )
 
-                with col_y2:
-                    y_max = st.number_input(
-                        "Y maximum",
-                        value=float(y_high),
-                        format="%.6g",
-                        key=f"{prefix}_y_max",
-                    )
+                    with ya:
+                        y_min = st.number_input(
+                            "Y minimum",
+                            value=y_default_min,
+                            step=y_step,
+                            format="%.6f",
+                            key=f"{key_prefix}_y_min",
+                        )
 
-                if y_min >= y_max:
-                    st.warning("Y minimum must be smaller than Y maximum.")
-                else:
-                    y_range = (float(y_min), float(y_max))
+                    with yb:
+                        y_max = st.number_input(
+                            "Y maximum",
+                            value=y_default_max,
+                            step=y_step,
+                            format="%.6f",
+                            key=f"{key_prefix}_y_max",
+                        )
+
+                    if y_min >= y_max:
+                        st.warning(
+                            "Y minimum must be smaller than Y maximum."
+                        )
+                    else:
+                        y_range = (
+                            float(y_min),
+                            float(y_max),
+                        )
 
     return x_range, y_range
 
 
 def apply_axis_ranges(
     fig: go.Figure,
-    x_range: tuple[float, float] | None,
-    y_range: tuple[float, float] | None,
-    log_x: bool,
-) -> None:
-    """Apply manual Plotly axis limits when requested."""
+    x_range,
+    y_range,
+    *,
+    log_x: bool = False,
+):
+    """Apply manual display ranges to a Plotly figure."""
 
     if x_range is not None:
+
         if log_x:
             fig.update_xaxes(
                 range=[
@@ -652,58 +700,178 @@ def apply_axis_ranges(
                 ]
             )
         else:
-            fig.update_xaxes(range=list(x_range))
+            fig.update_xaxes(
+                range=list(x_range)
+            )
 
     if y_range is not None:
-        fig.update_yaxes(range=list(y_range))
+        fig.update_yaxes(
+            range=list(y_range)
+        )
 
 
-def plotly_config() -> dict:
-    """Common Plotly interaction settings."""
+def style_matplotlib_like(
+    fig: go.Figure,
+    *,
+    x_title: str,
+    y_title: str,
+    title: str | None = None,
+    log_x: bool = False,
+):
+    """Make Plotly look close to the original clean Matplotlib figures."""
 
-    return {
-        "scrollZoom": True,
-        "displaylogo": False,
-        "responsive": True,
-        "modeBarButtonsToAdd": ["drawline", "eraseshape"],
-    }
-
-
-def histogram_trace(
-    values: np.ndarray,
-    bins: np.ndarray,
-    name: str,
-    log_x: bool,
-    opacity: float = 0.85,
-) -> go.Bar:
-    """Build an interactive histogram trace from explicit bin edges."""
-
-    values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-
-    if log_x:
-        values = values[values > 0]
-
-    counts, edges = np.histogram(values, bins=bins)
-
-    if log_x:
-        centres = np.sqrt(edges[:-1] * edges[1:])
-    else:
-        centres = 0.5 * (edges[:-1] + edges[1:])
-
-    widths = np.diff(edges)
-
-    return go.Bar(
-        x=centres,
-        y=counts,
-        width=widths,
-        name=name,
-        opacity=opacity,
-        customdata=np.column_stack([edges[:-1], edges[1:]]),
-        hovertemplate=(
-            "Dwell bin: %{customdata[0]:.5g}–%{customdata[1]:.5g} ms"
-            "<br>Count: %{y:,}<extra>%{fullData.name}</extra>"
+    fig.update_layout(
+        template=None,
+        height=470,
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        font=dict(
+            color="black",
+            size=13,
         ),
+        title=dict(
+            text=title,
+            x=0.5,
+            xanchor="center",
+        ) if title else None,
+        margin=dict(
+            l=70,
+            r=25,
+            t=55 if title else 25,
+            b=65,
+        ),
+        hovermode="closest",
+        dragmode="zoom",
+        legend=dict(
+            bgcolor="rgba(255,255,255,0.88)",
+            bordercolor="rgba(0,0,0,0.25)",
+            borderwidth=1,
+        ),
+    )
+
+    fig.update_xaxes(
+        title=x_title,
+        type="log" if log_x else "linear",
+        showgrid=False,
+        zeroline=False,
+        showline=True,
+        linecolor="black",
+        linewidth=1,
+        ticks="outside",
+        tickcolor="black",
+        mirror=False,
+    )
+
+    fig.update_yaxes(
+        title=y_title,
+        showgrid=False,
+        zeroline=False,
+        showline=True,
+        linecolor="black",
+        linewidth=1,
+        ticks="outside",
+        tickcolor="black",
+        mirror=False,
+    )
+
+
+def style_dark_density(
+    fig: go.Figure,
+    *,
+    x_title: str,
+    y_title: str,
+    title: str,
+    log_x: bool = False,
+):
+    """Keep the smooth dark density-map appearance from the static version."""
+
+    fig.update_layout(
+        template=None,
+        height=525,
+        paper_bgcolor="black",
+        plot_bgcolor="black",
+        font=dict(
+            color="white",
+            size=13,
+        ),
+        title=dict(
+            text=title,
+            x=0.5,
+            xanchor="center",
+            font=dict(color="white"),
+        ),
+        margin=dict(
+            l=80,
+            r=30,
+            t=60,
+            b=70,
+        ),
+        hovermode="closest",
+        dragmode="zoom",
+        legend=dict(
+            bgcolor="rgba(0,0,0,0.55)",
+            bordercolor="rgba(255,255,255,0.4)",
+            borderwidth=1,
+            font=dict(color="white"),
+        ),
+    )
+
+    fig.update_xaxes(
+        title=x_title,
+        type="log" if log_x else "linear",
+        showgrid=False,
+        zeroline=False,
+        showline=True,
+        linecolor="white",
+        linewidth=1,
+        tickcolor="white",
+        tickfont=dict(color="white"),
+        title_font=dict(color="white"),
+        ticks="outside",
+    )
+
+    fig.update_yaxes(
+        title=y_title,
+        showgrid=False,
+        zeroline=False,
+        showline=True,
+        linecolor="white",
+        linewidth=1,
+        tickcolor="white",
+        tickfont=dict(color="white"),
+        title_font=dict(color="white"),
+        ticks="outside",
+    )
+
+
+def add_cutoff_line(
+    fig: go.Figure,
+    cutoff_ms: float,
+    y_min: float,
+    y_max: float,
+    *,
+    dark: bool = False,
+):
+    """Add the cutoff as a normal trace so it remains visible in the legend."""
+
+    line_color = "white" if dark else "black"
+
+    fig.add_trace(
+        go.Scatter(
+            x=[cutoff_ms, cutoff_ms],
+            y=[y_min, y_max],
+            mode="lines",
+            line=dict(
+                color=line_color,
+                dash="dash",
+                width=2,
+            ),
+            name=f"Cutoff = {cutoff_ms:.4f} ms",
+            hovertemplate=(
+                f"Cutoff: {cutoff_ms:.5f} ms"
+                "<extra></extra>"
+            ),
+        )
     )
 
 
@@ -1041,11 +1209,6 @@ def main() -> None:
             "Event population plots"
         )
 
-        st.caption(
-            "All plots are interactive: hover for values, drag to zoom, "
-            "scroll to zoom, pan, and use the toolbar to reset/autoscale."
-        )
-
         plot_type = st.radio(
             "Plot type",
             [
@@ -1057,7 +1220,7 @@ def main() -> None:
         )
 
         # ====================================================
-        # A. INTERACTIVE HISTOGRAM
+        # A. HISTOGRAM
         # ====================================================
 
         if plot_type == "Dwell histogram":
@@ -1082,22 +1245,31 @@ def main() -> None:
 
             if hist_view == "Short":
                 hist_values = dwell_ms[short_idx]
+
             elif hist_view == "Long":
                 hist_values = dwell_ms[long_idx]
+
             else:
                 hist_values = dwell_ms
 
+            # ------------------------------------------------
+            # BIN EDGES
+            # ------------------------------------------------
+
             if log_axis:
+
                 positive_values = hist_values[
                     np.isfinite(hist_values)
                     & (hist_values > 0)
                 ]
 
                 if len(positive_values) == 0:
+
                     st.warning(
                         "No positive dwell times are available "
                         "for a logarithmic histogram."
                     )
+
                     st.stop()
 
                 n_log_bins = st.slider(
@@ -1110,13 +1282,27 @@ def main() -> None:
                 )
 
                 bins = np.logspace(
-                    np.log10(np.min(positive_values)),
-                    np.log10(np.max(positive_values)),
+                    np.log10(
+                        np.min(
+                            positive_values
+                        )
+                    ),
+                    np.log10(
+                        np.max(
+                            positive_values
+                        )
+                    ),
                     n_log_bins,
                 )
 
             else:
-                default_width = float(max(dwell_resolution_ms, 0.001))
+
+                default_width = float(
+                    max(
+                        dwell_resolution_ms,
+                        0.001,
+                    )
+                )
 
                 bin_width_ms = st.number_input(
                     "Histogram bin width (ms)",
@@ -1132,84 +1318,174 @@ def main() -> None:
                     ),
                 )
 
-                bins = linear_histogram_edges(hist_values, bin_width_ms)
+                bins = linear_histogram_edges(
+                    hist_values,
+                    bin_width_ms,
+                )
+
+            # ------------------------------------------------
+            # BUILD ORIGINAL-STYLE INTERACTIVE HISTOGRAM
+            # ------------------------------------------------
 
             fig = go.Figure()
+            all_counts = []
+
+            def add_hist_trace(values, name, opacity, color):
+
+                values = finite_values(
+                    values,
+                    positive_only=log_axis,
+                )
+
+                counts, edges = np.histogram(
+                    values,
+                    bins=bins,
+                )
+
+                if log_axis:
+                    centers = np.sqrt(
+                        edges[:-1]
+                        * edges[1:]
+                    )
+                else:
+                    centers = (
+                        edges[:-1]
+                        + edges[1:]
+                    ) / 2.0
+
+                widths = (
+                    edges[1:]
+                    - edges[:-1]
+                )
+
+                custom = np.column_stack(
+                    [
+                        edges[:-1],
+                        edges[1:],
+                    ]
+                )
+
+                fig.add_trace(
+                    go.Bar(
+                        x=centers,
+                        y=counts,
+                        width=widths,
+                        opacity=opacity,
+                        name=name,
+                        marker=dict(
+                            color=color,
+                            line=dict(
+                                width=0,
+                            ),
+                        ),
+                        customdata=custom,
+                        hovertemplate=(
+                            "Dwell bin: %{customdata[0]:.5f}–"
+                            "%{customdata[1]:.5f} ms"
+                            "<br>Count: %{y:,}"
+                            "<extra>%{fullData.name}</extra>"
+                        ),
+                    )
+                )
+
+                all_counts.extend(
+                    counts.tolist()
+                )
 
             if hist_view == "Short + Long overlay":
-                fig.add_trace(
-                    histogram_trace(
-                        dwell_ms[short_idx],
-                        bins,
-                        f"Short ({len(short_idx):,})",
-                        log_axis,
-                        opacity=0.60,
-                    )
+
+                add_hist_trace(
+                    dwell_ms[short_idx],
+                    f"Short ({len(short_idx):,})",
+                    0.55,
+                    "#1f77b4",
                 )
-                fig.add_trace(
-                    histogram_trace(
-                        dwell_ms[long_idx],
-                        bins,
-                        f"Long ({len(long_idx):,})",
-                        log_axis,
-                        opacity=0.60,
-                    )
+
+                add_hist_trace(
+                    dwell_ms[long_idx],
+                    f"Long ({len(long_idx):,})",
+                    0.55,
+                    "#ff7f0e",
                 )
-                y_for_range = np.concatenate([
-                    np.histogram(dwell_ms[short_idx], bins=bins)[0],
-                    np.histogram(dwell_ms[long_idx], bins=bins)[0],
-                ])
+
+                fig.update_layout(
+                    barmode="overlay"
+                )
+
             else:
-                fig.add_trace(
-                    histogram_trace(
-                        hist_values,
-                        bins,
-                        f"{hist_view} ({len(hist_values):,})",
-                        log_axis,
-                    )
+
+                label = (
+                    f"{hist_view} "
+                    f"({len(hist_values):,})"
                 )
-                y_for_range = np.histogram(hist_values, bins=bins)[0]
 
-            fig.add_vline(
-                x=cutoff_ms,
-                line_dash="dash",
-                line_width=2,
-                annotation_text=f"cutoff {cutoff_ms:.4f} ms",
-                annotation_position="top",
+                add_hist_trace(
+                    hist_values,
+                    label,
+                    0.85,
+                    "#1f77b4",
+                )
+
+            max_count = (
+                max(all_counts)
+                if all_counts
+                else 1
             )
 
-            fig.update_layout(
-                title=f"{hist_view} dwell-time distribution",
-                xaxis_title="Dwell time (ms)",
-                yaxis_title="Count",
-                barmode="overlay",
-                hovermode="x unified",
-                height=500,
-                margin=dict(l=40, r=20, t=60, b=45),
+            add_cutoff_line(
+                fig,
+                cutoff_ms,
+                0,
+                max_count * 1.05,
             )
 
-            fig.update_xaxes(
-                type="log" if log_axis else "linear",
-                showgrid=True,
-            )
-
-            x_range, y_range = axis_range_controls(
-                "hist",
-                hist_values,
-                y_for_range,
+            style_matplotlib_like(
+                fig,
+                x_title="Dwell time (ms)",
+                y_title="Count",
+                title=(
+                    f"{hist_view} "
+                    "dwell-time distribution"
+                ),
                 log_x=log_axis,
             )
 
-            apply_axis_ranges(fig, x_range, y_range, log_axis)
+            x_controls_values = finite_values(
+                hist_values,
+                positive_only=log_axis,
+            )
+
+            x_range, y_range = manual_axis_controls(
+                "hist",
+                x_controls_values,
+                np.asarray(
+                    all_counts,
+                    dtype=float,
+                ),
+                log_x=log_axis,
+            )
+
+            apply_axis_ranges(
+                fig,
+                x_range,
+                y_range,
+                log_x=log_axis,
+            )
 
             st.plotly_chart(
                 fig,
                 use_container_width=True,
-                config=plotly_config(),
-                key="interactive_histogram",
+                config=PLOTLY_CONFIG,
+            )
+
+            st.caption(
+                "Hover over a bar to see the dwell-time interval and count. "
+                "Drag or scroll on the plot to zoom. Axis limits only change "
+                "the displayed view; they do not change the event split."
             )
 
             if not log_axis:
+
                 st.caption(
                     "The linear histogram uses a physical bin width rather "
                     "than a fixed number of bins. This is especially important "
@@ -1218,7 +1494,7 @@ def main() -> None:
                 )
 
         # ====================================================
-        # B. INTERACTIVE KDE DWELL DENSITY
+        # B. KDE DWELL DENSITY
         # ====================================================
 
         elif plot_type == "Dwell density (KDE)":
@@ -1228,8 +1504,9 @@ def main() -> None:
                 value=True,
                 key="kde_log_axis",
                 help=(
-                    "Recommended for nanopore dwell times because the "
-                    "distribution is usually strongly right-skewed."
+                    "Recommended for nanopore dwell times "
+                    "because the distribution is usually "
+                    "strongly right-skewed."
                 ),
             )
 
@@ -1240,179 +1517,270 @@ def main() -> None:
                     "All events",
                 ],
                 horizontal=True,
-                key="kde_population_view",
             )
 
             fig = go.Figure()
-            all_kde_y = []
-            all_kde_x = []
+
+            kde_x_values = []
+            kde_y_values = []
+
+            # ------------------------------------------------
+            # ALL EVENTS
+            # ------------------------------------------------
 
             if density_view == "All events":
-                x_all, d_all = kde_curve(dwell_ms, log_axis)
+
+                x_all, d_all = kde_curve(
+                    dwell_ms,
+                    log_axis,
+                )
 
                 if x_all is not None:
+
                     fig.add_trace(
                         go.Scatter(
                             x=x_all,
                             y=d_all,
                             mode="lines",
+                            line=dict(
+                                color="#1f77b4",
+                                width=2,
+                            ),
                             name="All events",
-                            line=dict(width=3),
                             hovertemplate=(
-                                "Dwell: %{x:.5g} ms"
-                                "<br>Density: %{y:.5g}<extra>All events</extra>"
+                                "Dwell time: %{x:.5f} ms"
+                                "<br>Density: %{y:.6g}"
+                                "<extra>All events</extra>"
                             ),
                         )
                     )
-                    all_kde_x.append(x_all)
-                    all_kde_y.append(d_all)
+
+                    kde_x_values.extend(
+                        x_all.tolist()
+                    )
+
+                    kde_y_values.extend(
+                        d_all.tolist()
+                    )
+
+            # ------------------------------------------------
+            # SHORT + LONG
+            # ------------------------------------------------
 
             else:
+
                 if len(short_idx) >= 2:
-                    x_short, d_short = kde_curve(dwell_ms[short_idx], log_axis)
+
+                    x_short, d_short = kde_curve(
+                        dwell_ms[
+                            short_idx
+                        ],
+                        log_axis,
+                    )
 
                     if x_short is not None:
+
                         fig.add_trace(
                             go.Scatter(
                                 x=x_short,
                                 y=d_short,
                                 mode="lines",
-                                name=f"Short ({len(short_idx):,})",
-                                line=dict(width=3),
+                                line=dict(
+                                    color="#1f77b4",
+                                    width=2,
+                                ),
+                                name=(
+                                    f"Short "
+                                    f"({len(short_idx):,})"
+                                ),
                                 hovertemplate=(
-                                    "Dwell: %{x:.5g} ms"
-                                    "<br>Density: %{y:.5g}<extra>Short</extra>"
+                                    "Dwell time: %{x:.5f} ms"
+                                    "<br>Density: %{y:.6g}"
+                                    "<extra>Short</extra>"
                                 ),
                             )
                         )
-                        all_kde_x.append(x_short)
-                        all_kde_y.append(d_short)
+
+                        kde_x_values.extend(
+                            x_short.tolist()
+                        )
+
+                        kde_y_values.extend(
+                            d_short.tolist()
+                        )
 
                 if len(long_idx) >= 2:
-                    x_long, d_long = kde_curve(dwell_ms[long_idx], log_axis)
+
+                    x_long, d_long = kde_curve(
+                        dwell_ms[
+                            long_idx
+                        ],
+                        log_axis,
+                    )
 
                     if x_long is not None:
+
                         fig.add_trace(
                             go.Scatter(
                                 x=x_long,
                                 y=d_long,
                                 mode="lines",
-                                name=f"Long ({len(long_idx):,})",
-                                line=dict(width=3),
+                                line=dict(
+                                    color="#ff7f0e",
+                                    width=2,
+                                ),
+                                name=(
+                                    f"Long "
+                                    f"({len(long_idx):,})"
+                                ),
                                 hovertemplate=(
-                                    "Dwell: %{x:.5g} ms"
-                                    "<br>Density: %{y:.5g}<extra>Long</extra>"
+                                    "Dwell time: %{x:.5f} ms"
+                                    "<br>Density: %{y:.6g}"
+                                    "<extra>Long</extra>"
                                 ),
                             )
                         )
-                        all_kde_x.append(x_long)
-                        all_kde_y.append(d_long)
 
-            fig.add_vline(
-                x=cutoff_ms,
-                line_dash="dash",
-                line_width=2,
-                annotation_text=f"cutoff {cutoff_ms:.4f} ms",
-                annotation_position="top",
+                        kde_x_values.extend(
+                            x_long.tolist()
+                        )
+
+                        kde_y_values.extend(
+                            d_long.tolist()
+                        )
+
+            max_density = (
+                max(kde_y_values)
+                if kde_y_values
+                else 1.0
             )
 
-            fig.update_layout(
-                title="Dwell-time KDE",
-                xaxis_title="Dwell time (ms)",
-                yaxis_title=(
+            add_cutoff_line(
+                fig,
+                cutoff_ms,
+                0,
+                max_density * 1.05,
+            )
+
+            style_matplotlib_like(
+                fig,
+                x_title="Dwell time (ms)",
+                y_title=(
                     "KDE density in log10(dwell time)"
                     if log_axis
                     else "KDE density"
                 ),
-                hovermode="x unified",
-                height=500,
-                margin=dict(l=40, r=20, t=60, b=45),
-            )
-
-            fig.update_xaxes(
-                type="log" if log_axis else "linear",
-                showgrid=True,
-            )
-
-            if all_kde_x:
-                x_for_range = np.concatenate(all_kde_x)
-                y_for_range = np.concatenate(all_kde_y)
-            else:
-                x_for_range = dwell_ms
-                y_for_range = np.array([0.0, 1.0])
-
-            x_range, y_range = axis_range_controls(
-                "kde",
-                x_for_range,
-                y_for_range,
                 log_x=log_axis,
             )
 
-            apply_axis_ranges(fig, x_range, y_range, log_axis)
+            x_range, y_range = manual_axis_controls(
+                "kde",
+                np.asarray(
+                    kde_x_values,
+                    dtype=float,
+                ),
+                np.asarray(
+                    kde_y_values,
+                    dtype=float,
+                ),
+                log_x=log_axis,
+            )
+
+            apply_axis_ranges(
+                fig,
+                x_range,
+                y_range,
+                log_x=log_axis,
+            )
 
             st.plotly_chart(
                 fig,
                 use_container_width=True,
-                config=plotly_config(),
-                key="interactive_kde",
+                config=PLOTLY_CONFIG,
             )
 
             st.caption(
-                "The KDE is a smoothed view of the dwell-time distribution. "
-                "Use it together with the histogram and 2D density plot when "
-                "deciding the split."
+                "Hover over the density curve to read the dwell time and KDE "
+                "density. You can drag or scroll to zoom, or enter exact axis "
+                "limits above."
             )
 
         # ====================================================
-        # C. INTERACTIVE 2D EVENT DENSITY
+        # C. 2D EVENT DENSITY
         # ====================================================
 
         elif plot_type == "2D event density":
 
             st.caption(
-                "Dwell time is on the x-axis. The density field is "
-                "Gaussian-smoothed to give a continuous population map."
+                "Dwell time is on the x-axis. "
+                "The density appearance is kept close to the smooth static "
+                "version, while an invisible event layer provides exact hover "
+                "readouts for the underlying events."
             )
+
+            # ------------------------------------------------
+            # AVAILABLE Y METRICS
+            # ------------------------------------------------
 
             y_options = {
                 "Peak segment ΔI (from event_fitting)":
-                    derived_metrics["Peak segment ΔI"],
+                    derived_metrics[
+                        "Peak segment ΔI"
+                    ],
+
                 "Time-weighted segment ΔI (from event_fitting)":
-                    derived_metrics["Time-weighted segment ΔI"],
+                    derived_metrics[
+                        "Time-weighted segment ΔI"
+                    ],
+
                 "Number of segments (from event_fitting)":
-                    derived_metrics["Number of segments"],
+                    derived_metrics[
+                        "Number of segments"
+                    ],
             }
 
-            for j in range(X.shape[1]):
+            # ------------------------------------------------
+            # ADD RAW DATASET COLUMNS
+            # ------------------------------------------------
+
+            for j in range(
+                X.shape[1]
+            ):
+
+                # X[:,4] is dwell time and is already on the x-axis.
                 if j == 4:
                     continue
 
-                y_options[f"Raw dataset X[:, {j}]"] = X[:, j]
+                y_options[
+                    f"Raw dataset X[:, {j}]"
+                ] = X[:, j]
 
-            controls_a, controls_b = st.columns(2)
+            controls_a, controls_b = st.columns(
+                2
+            )
 
             with controls_a:
+
                 y_name = st.selectbox(
                     "Y-axis metric",
-                    options=list(y_options.keys()),
+                    options=list(
+                        y_options.keys()
+                    ),
                     index=0,
                 )
 
                 population_view = st.radio(
                     "Population",
-                    ["All", "Short", "Long"],
+                    [
+                        "All",
+                        "Short",
+                        "Long",
+                    ],
                     horizontal=True,
-                    key="density_population_view",
-                )
-
-                colourscale = st.selectbox(
-                    "Density colour map",
-                    ["Magma", "Inferno", "Viridis", "Plasma", "Turbo"],
-                    index=0,
-                    help="This changes only the visual appearance.",
                 )
 
             with controls_b:
+
                 log_axis = st.toggle(
                     "Logarithmic dwell-time axis",
                     value=True,
@@ -1446,52 +1814,138 @@ def main() -> None:
                     value=0.5,
                     step=0.1,
                     help=(
-                        "Low-density regions below this fraction of the peak "
-                        "are hidden to give the glowing density-map look."
+                        "Low-density regions below this fraction of the "
+                        "peak are hidden to preserve the clean density-map look."
                     ),
                 )
 
-            y_values = np.asarray(y_options[y_name], dtype=float)
+            # ------------------------------------------------
+            # DATA SELECTION
+            # ------------------------------------------------
+
+            y_values = np.asarray(
+                y_options[
+                    y_name
+                ],
+                dtype=float,
+            )
 
             if population_view == "Short":
                 selected = short_idx
+
             elif population_view == "Long":
                 selected = long_idx
+
             else:
-                selected = np.arange(n_events)
+                selected = np.arange(
+                    n_events
+                )
 
-            x_plot = dwell_ms[selected]
-            y_plot = y_values[selected]
+            x_plot = dwell_ms[
+                selected
+            ]
 
-            valid = np.isfinite(x_plot) & np.isfinite(y_plot)
+            y_plot = y_values[
+                selected
+            ]
+
+            event_ids = np.asarray(
+                selected,
+                dtype=int,
+            )
+
+            valid = (
+                np.isfinite(
+                    x_plot
+                )
+                &
+                np.isfinite(
+                    y_plot
+                )
+            )
 
             if log_axis:
-                valid &= x_plot > 0
+                valid &= (
+                    x_plot > 0
+                )
 
-            x_plot = x_plot[valid]
-            y_plot = y_plot[valid]
+            x_plot = x_plot[
+                valid
+            ]
+
+            y_plot = y_plot[
+                valid
+            ]
+
+            event_ids = event_ids[
+                valid
+            ]
 
             if len(x_plot) == 0:
-                st.warning("No finite points are available for this plot.")
+
+                st.warning(
+                    "No finite points are available "
+                    "for this plot."
+                )
 
             else:
-                p_low, p_high = st.slider(
+
+                # --------------------------------------------
+                # OPTIONAL DISPLAY FILTER
+                # --------------------------------------------
+
+                (
+                    p_low,
+                    p_high,
+                ) = st.slider(
                     "Displayed Y percentile range",
                     min_value=0.0,
                     max_value=100.0,
-                    value=(0.0, 100.0),
+                    value=(
+                        0.0,
+                        100.0,
+                    ),
                     step=0.5,
                     help=(
-                        "Useful if a few extreme outliers squash the main "
-                        "density cloud. Keep 0–100% to display everything."
+                        "Useful if a few extreme outliers squash the "
+                        "main density cloud. Keep 0–100% to display everything."
                     ),
                 )
 
-                if p_low > 0.0 or p_high < 100.0:
-                    y_low, y_high = np.percentile(y_plot, [p_low, p_high])
-                    keep = (y_plot >= y_low) & (y_plot <= y_high)
-                    x_plot = x_plot[keep]
-                    y_plot = y_plot[keep]
+                if (
+                    p_low > 0.0
+                    or p_high < 100.0
+                ):
+
+                    y_low, y_high = np.percentile(
+                        y_plot,
+                        [
+                            p_low,
+                            p_high,
+                        ],
+                    )
+
+                    keep = (
+                        (y_plot >= y_low)
+                        &
+                        (y_plot <= y_high)
+                    )
+
+                    x_plot = x_plot[
+                        keep
+                    ]
+
+                    y_plot = y_plot[
+                        keep
+                    ]
+
+                    event_ids = event_ids[
+                        keep
+                    ]
+
+                # --------------------------------------------
+                # SMOOTH DENSITY FIELD
+                # --------------------------------------------
 
                 x_edges, y_edges, density = smooth_2d_hist_density(
                     x_plot,
@@ -1502,92 +1956,171 @@ def main() -> None:
                 )
 
                 if density is None:
+
                     st.warning(
-                        "Not enough valid points are available to calculate "
-                        "the density map."
+                        "Not enough valid points are available "
+                        "to calculate the density map."
                     )
 
                 else:
+
                     threshold = (
                         density_threshold_percent
                         / 100.0
-                        * float(np.max(density))
+                        * float(
+                            np.max(
+                                density
+                            )
+                        )
                     )
 
-                    z = density.astype(float).copy()
-                    z[z <= threshold] = np.nan
+                    density_display = density.copy()
+                    density_display[
+                        density_display
+                        <= threshold
+                    ] = np.nan
 
+                    # Centres of the density cells.
                     if log_axis:
-                        x_centres = np.sqrt(x_edges[:-1] * x_edges[1:])
+
+                        x_centers = np.sqrt(
+                            x_edges[:-1]
+                            * x_edges[1:]
+                        )
+
                     else:
-                        x_centres = 0.5 * (x_edges[:-1] + x_edges[1:])
 
-                    y_centres = 0.5 * (y_edges[:-1] + y_edges[1:])
+                        x_centers = (
+                            x_edges[:-1]
+                            + x_edges[1:]
+                        ) / 2.0
 
-                    fig = go.Figure(
-                        data=go.Heatmap(
-                            x=x_centres,
-                            y=y_centres,
-                            z=z,
-                            colorscale=colourscale,
-                            zsmooth="best",
-                            colorbar=dict(title="Smoothed density"),
-                            hovertemplate=(
-                                "Dwell: %{x:.5g} ms"
-                                "<br>Y: %{y:.5g}"
-                                "<br>Density: %{z:.5g}<extra></extra>"
+                    y_centers = (
+                        y_edges[:-1]
+                        + y_edges[1:]
+                    ) / 2.0
+
+                    fig = go.Figure()
+
+                    # ----------------------------------------
+                    # VISUAL DENSITY LAYER
+                    # ----------------------------------------
+
+                    fig.add_trace(
+                        go.Heatmap(
+                            x=x_centers,
+                            y=y_centers,
+                            z=density_display,
+                            colorscale="Magma",
+                            showscale=True,
+                            hoverinfo="skip",
+                            colorbar=dict(
+                                title=dict(
+                                    text="Smoothed<br>event density",
+                                    font=dict(
+                                        color="white"
+                                    ),
+                                ),
+                                tickfont=dict(
+                                    color="white"
+                                ),
+                                outlinecolor="white",
+                                outlinewidth=0.5,
                             ),
                         )
                     )
 
-                    fig.add_vline(
-                        x=cutoff_ms,
-                        line_dash="dash",
-                        line_width=2,
-                        line_color="white",
-                        annotation_text=f"cutoff {cutoff_ms:.4f} ms",
-                        annotation_position="top",
-                        annotation_font_color="white",
+                    # ----------------------------------------
+                    # INVISIBLE EVENT HOVER LAYER
+                    # ----------------------------------------
+                    #
+                    # This layer is intentionally almost invisible, so the
+                    # density plot keeps the same smooth appearance. Hovering
+                    # over an actual event reports its coordinates.
+                    # ----------------------------------------
+
+                    hover_custom = np.column_stack(
+                        [
+                            event_ids,
+                        ]
                     )
 
-                    fig.update_layout(
-                        title=f"{population_view} events",
-                        xaxis_title="Dwell time (ms)",
-                        yaxis_title=y_name,
-                        template="plotly_dark",
-                        paper_bgcolor="black",
-                        plot_bgcolor="black",
-                        height=570,
-                        margin=dict(l=50, r=20, t=60, b=50),
+                    fig.add_trace(
+                        go.Scattergl(
+                            x=x_plot,
+                            y=y_plot,
+                            mode="markers",
+                            marker=dict(
+                                size=8,
+                                color="rgba(255,255,255,0.01)",
+                                line=dict(
+                                    width=0,
+                                ),
+                            ),
+                            customdata=hover_custom,
+                            name="Events",
+                            showlegend=False,
+                            hovertemplate=(
+                                "Event ID: %{customdata[0]:.0f}"
+                                "<br>Dwell time: %{x:.5f} ms"
+                                f"<br>{y_name}: "
+                                "%{y:.6g}"
+                                "<extra></extra>"
+                            ),
+                        )
                     )
 
-                    fig.update_xaxes(
-                        type="log" if log_axis else "linear",
-                        showgrid=False,
+                    add_cutoff_line(
+                        fig,
+                        cutoff_ms,
+                        float(
+                            np.min(
+                                y_plot
+                            )
+                        ),
+                        float(
+                            np.max(
+                                y_plot
+                            )
+                        ),
+                        dark=True,
                     )
-                    fig.update_yaxes(showgrid=False)
 
-                    x_range, y_range = axis_range_controls(
+                    style_dark_density(
+                        fig,
+                        x_title="Dwell time (ms)",
+                        y_title=y_name,
+                        title=(
+                            f"{population_view} events"
+                        ),
+                        log_x=log_axis,
+                    )
+
+                    x_range, y_range = manual_axis_controls(
                         "density2d",
                         x_plot,
                         y_plot,
                         log_x=log_axis,
                     )
 
-                    apply_axis_ranges(fig, x_range, y_range, log_axis)
+                    apply_axis_ranges(
+                        fig,
+                        x_range,
+                        y_range,
+                        log_x=log_axis,
+                    )
 
                     st.plotly_chart(
                         fig,
                         use_container_width=True,
-                        config=plotly_config(),
-                        key="interactive_2d_density",
+                        config=PLOTLY_CONFIG,
                     )
 
                     st.caption(
-                        f"Showing **{len(x_plot):,}** finite events. The dashed "
-                        "line is the same dwell-time cutoff used for SHORT/LONG "
-                        "export. Smoothing and axis zoom affect only the plot, "
-                        "not the underlying event data or population split."
+                        f"Showing **{len(x_plot):,}** finite events. "
+                        "Hover over an event to see its original event ID, "
+                        "dwell time, and Y-axis value. Manual axis limits and "
+                        "mouse zoom change only the view, not the split or export."
                     )
 
     # ========================================================
