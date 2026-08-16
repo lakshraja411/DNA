@@ -24,7 +24,7 @@ from splitter_core import (
 )
 
 
-APP_VERSION = "1.4.1-mpl-label"
+APP_VERSION = "1.4.2-mpl-exclusions"
 
 
 # ============================================================
@@ -927,8 +927,18 @@ def make_2d_gmm_zip(
     long_map: pd.DataFrame,
     p_short: np.ndarray,
     p_long: np.ndarray,
+    excluded_idx: np.ndarray | None = None,
+    dwell_ms: np.ndarray | None = None,
+    delta_i: np.ndarray | None = None,
 ) -> bytes:
-    """Package synchronized 2D-GMM populations into one ZIP archive."""
+    """
+    Package synchronized 2D-GMM populations into one ZIP archive.
+
+    Events without valid 2D features are never silently discarded. If the
+    user explicitly chooses to continue, they are written to
+    excluded_events.csv with their original row indices and the reason they
+    could not be classified.
+    """
 
     short_map = short_map.copy()
     long_map = long_map.copy()
@@ -958,6 +968,69 @@ def make_2d_gmm_zip(
         long_map[
             "gmm_p_long_like"
         ] = p_long[source_rows]
+
+    if excluded_idx is None:
+        excluded_idx = np.array([], dtype=int)
+    else:
+        excluded_idx = np.asarray(
+            excluded_idx,
+            dtype=int,
+        )
+
+    excluded_table = pd.DataFrame()
+
+    if len(excluded_idx):
+
+        if dwell_ms is None or delta_i is None:
+            raise ValueError(
+                "dwell_ms and delta_i are required when excluded events are recorded."
+            )
+
+        dwell_ms = np.asarray(
+            dwell_ms,
+            dtype=float,
+        )
+
+        delta_i = np.asarray(
+            delta_i,
+            dtype=float,
+        )
+
+        exclusion_reasons = []
+
+        for idx in excluded_idx:
+
+            reasons = []
+
+            if not np.isfinite(dwell_ms[idx]):
+                reasons.append(
+                    "non-finite dwell time"
+                )
+
+            elif dwell_ms[idx] <= 0:
+                reasons.append(
+                    "non-positive dwell time"
+                )
+
+            if not np.isfinite(delta_i[idx]):
+                reasons.append(
+                    "non-finite ΔI"
+                )
+
+            exclusion_reasons.append(
+                "; ".join(reasons)
+                if reasons
+                else "invalid 2D feature"
+            )
+
+        excluded_table = pd.DataFrame(
+            {
+                "original_row_index": excluded_idx,
+                "dwell_time_ms": dwell_ms[excluded_idx],
+                "delta_i": delta_i[excluded_idx],
+                "exclusion_reason": exclusion_reasons,
+            }
+        )
 
     buffer = io.BytesIO()
 
@@ -1000,6 +1073,25 @@ def make_2d_gmm_zip(
             mapping.to_csv(index=False).encode("utf-8"),
         )
 
+        if len(excluded_table):
+
+            zf.writestr(
+                "excluded_events.csv",
+                excluded_table.to_csv(index=False).encode("utf-8"),
+            )
+
+        excluded_note = (
+            f"Excluded/unclassified events: {len(excluded_idx)}\n"
+        )
+
+        if len(excluded_idx):
+
+            excluded_note += (
+                "These events were not assigned to either 2D population because "
+                "one or more required 2D features were invalid. "
+                "They are listed in excluded_events.csv.\n"
+            )
+
         zf.writestr(
             "split_info.txt",
             (
@@ -1012,9 +1104,10 @@ def make_2d_gmm_zip(
                 "to their median dwell time.\n"
                 "There is no single dwell-time cutoff for this 2D split.\n"
                 f"Short-like events: {len(short_map)}\n"
-                f"Long-like events: {len(long_map)}\n\n"
-                "Each population contains synchronized event_data, dataset, "
-                "and event_fitting NPZ files.\n"
+                f"Long-like events: {len(long_map)}\n"
+                f"{excluded_note}\n"
+                "Each exported population contains synchronized event_data, "
+                "dataset, and event_fitting NPZ files.\n"
                 "Event IDs are re-numbered 0..N-1 within each population.\n"
                 "event_id_mapping.csv preserves original event IDs, row "
                 "indices, and GMM posterior assignment probabilities.\n"
@@ -2870,6 +2963,7 @@ def main() -> None:
     )
 
     export_ready = True
+    export_excluded_idx = np.array([], dtype=int)
 
     if export_method == "1D dwell-time split":
 
@@ -2910,21 +3004,49 @@ def main() -> None:
                 "long_idx"
             ]
 
+            export_excluded_idx = np.flatnonzero(
+                ~gmm2d_result["valid"]
+            )
+
             n_unclassified_2d = int(
-                np.sum(
-                    ~gmm2d_result["valid"]
-                )
+                len(export_excluded_idx)
             )
 
             if n_unclassified_2d:
 
-                st.warning(
-                    f"2D export is disabled because {n_unclassified_2d:,} events "
-                    "do not have a finite ΔI value. This app will not silently "
-                    "discard those events."
+                excluded_fraction = (
+                    100.0
+                    * n_unclassified_2d
+                    / n_events
                 )
 
-                export_ready = False
+                st.warning(
+                    f"{n_unclassified_2d:,} of {n_events:,} events "
+                    f"({excluded_fraction:.3f}%) cannot be classified by the "
+                    "2D GMM because dwell time and/or ΔI is invalid."
+                )
+
+                st.caption(
+                    "These events will never be silently assigned to Short-like "
+                    "or Long-like. If you continue, they will be omitted from the "
+                    "two population NPZ files and recorded separately in "
+                    "excluded_events.csv with the reason for exclusion."
+                )
+
+                exclude_unclassified_2d = st.checkbox(
+                    "Exclude unclassifiable events from the 2D split and continue",
+                    value=False,
+                    key="allow_2d_unclassified_exclusion_v142",
+                    help=(
+                        "Only events with valid positive dwell time and finite ΔI "
+                        "can be classified by the 2D GMM. Excluded events are "
+                        "listed explicitly in the exported ZIP."
+                    ),
+                )
+
+                if not exclude_unclassified_2d:
+
+                    export_ready = False
 
             if (
                 not len(export_short_idx)
@@ -2939,9 +3061,9 @@ def main() -> None:
 
     # Use version-specific session keys so stale state from an older app
     # cannot trigger a KeyError after deployment.
-    result_zip_key = "result_zip_v140mpl"
-    result_name_key = "result_name_v140mpl"
-    result_message_key = "result_message_v140mpl"
+    result_zip_key = "result_zip_v142mpl"
+    result_name_key = "result_name_v142mpl"
+    result_message_key = "result_message_v142mpl"
 
     if st.button(
         "Build filtered files",
@@ -3022,6 +3144,9 @@ def main() -> None:
                 long_map,
                 gmm2d_result["p_short"],
                 gmm2d_result["p_long"],
+                excluded_idx=export_excluded_idx,
+                dwell_ms=dwell_ms,
+                delta_i=gmm2d_delta_i,
             )
 
             result_name = (
@@ -3033,6 +3158,14 @@ def main() -> None:
                 f"**{len(export_long_idx):,} 2D Long-like** events using "
                 f"**log10(dwell time) + {gmm2d_delta_i_name}**."
             )
+
+            if len(export_excluded_idx):
+
+                result_message += (
+                    f" **{len(export_excluded_idx):,} unclassifiable event(s)** "
+                    "were excluded from the two populations and recorded in "
+                    "`excluded_events.csv`."
+                )
 
         progress.progress(
             100,
