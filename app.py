@@ -24,7 +24,7 @@ from splitter_core import (
 )
 
 
-APP_VERSION = "1.4.0-mpl"
+APP_VERSION = "1.4.1-mpl-label"
 
 
 # ============================================================
@@ -1401,9 +1401,9 @@ def main() -> None:
                     if 0 in gmm2d_dataset_columns
                     else 0
                 ),
-                format_func=lambda j: f"X[:, {j}]",
+                format_func=lambda j: "ΔI" if j == 0 else f"X[:, {j}]",
                 help=(
-                    "X[:,0] is the default for your current dataset layout. "
+                    "X[:,0] is the event blockade height ΔI for your current dataset layout. "
                     "Do not choose the dwell-time column X[:,4]."
                 ),
             )
@@ -1414,7 +1414,9 @@ def main() -> None:
             )
 
             gmm2d_delta_i_name = (
-                f"dataset.npz X[:, {gmm2d_dataset_col}]"
+                "ΔI (nA)"
+                if gmm2d_dataset_col == 0
+                else f"dataset.npz X[:, {gmm2d_dataset_col}]"
             )
 
         elif gmm2d_source == "Peak segment ΔI from event_fitting":
@@ -2266,17 +2268,21 @@ def main() -> None:
                     "dataset.npz ΔI column",
                     options=list(range(X.shape[1])),
                     index=0,
-                    format_func=lambda j: f"X[:, {j}]",
+                    format_func=lambda j: "ΔI" if j == 0 else f"X[:, {j}]",
                     help=(
-                        "Default is X[:,0] for the uploaded dataset. "
+                        "X[:,0] is the event blockade height ΔI for the uploaded dataset. "
                         "This is adjustable because dataset feature layouts "
                         "can vary between analysis/software versions."
                     ),
                 )
 
                 y_name = (
-                    f"ΔI from dataset.npz "
-                    f"(X[:, {dataset_delta_i_col}])"
+                    "ΔI"
+                    if dataset_delta_i_col == 0
+                    else (
+                        f"ΔI from dataset.npz "
+                        f"(X[:, {dataset_delta_i_col}])"
+                    )
                 )
 
                 y_values = np.asarray(
@@ -2378,7 +2384,11 @@ def main() -> None:
                         * 1000.0
                     )
 
-                    if "dataset.npz" in y_name:
+                    if dataset_delta_i_col == 0 and y_source == "ΔI from dataset.npz":
+
+                        y_name = "ΔI (pA)"
+
+                    elif "dataset.npz" in y_name:
 
                         y_name = (
                             "ΔI from dataset.npz "
@@ -2401,7 +2411,11 @@ def main() -> None:
 
                 else:
 
-                    if "dataset.npz" in y_name:
+                    if dataset_delta_i_col == 0 and y_source == "ΔI from dataset.npz":
+
+                        y_name = "ΔI (nA)"
+
+                    elif "dataset.npz" in y_name:
 
                         y_name = (
                             "ΔI from dataset.npz "
