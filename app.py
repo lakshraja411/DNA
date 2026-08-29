@@ -24,7 +24,7 @@ from splitter_core import (
 )
 
 
-APP_VERSION = "1.4.4-bic-selected-split"
+APP_VERSION = "1.4.5-bic-user-selected-k"
 
 
 # ============================================================
@@ -872,6 +872,7 @@ def select_2d_gmm_components_bic(
         "table": table,
         "best_k": best_k,
         "best_model": models[best_k],
+        "models": models,
         "scaler": scaler,
         "valid": valid,
         "valid_idx": valid_idx,
@@ -882,10 +883,12 @@ def build_bic_selected_population_result(
     bic_result: dict,
     dwell_ms: np.ndarray,
     delta_i: np.ndarray,
+    selected_k: int | None = None,
 ):
-    """Turn the BIC-selected GMM into ordered event populations.
+    """Turn a BIC-tested GMM into ordered event populations.
 
-    The selected model may contain K = 1..N Gaussian components. Components are
+    By default this uses the minimum-BIC model. If selected_k is supplied, the
+    corresponding already-fitted candidate model is used instead. Components are
     ordered by the median ORIGINAL dwell time of their assigned events so that
     Cluster 1 is the shortest-dwell statistical population and Cluster K is the
     longest-dwell statistical population. The labels remain generic clusters;
@@ -895,7 +898,18 @@ def build_bic_selected_population_result(
     dwell_ms = np.asarray(dwell_ms, dtype=float)
     delta_i = np.asarray(delta_i, dtype=float)
 
-    model = bic_result["best_model"]
+    if selected_k is None:
+        selected_k = int(bic_result["best_k"])
+    else:
+        selected_k = int(selected_k)
+
+    models = bic_result.get("models", {})
+    if selected_k not in models:
+        raise ValueError(
+            f"K = {selected_k} was not included in the BIC candidate models."
+        )
+
+    model = models[selected_k]
     scaler = bic_result["scaler"]
     valid = np.asarray(bic_result["valid"], dtype=bool)
     valid_idx = np.asarray(bic_result["valid_idx"], dtype=int)
@@ -1355,13 +1369,21 @@ def make_bic_selected_gmm_zip(
     probabilities: np.ndarray,
     median_dwell_ms: np.ndarray,
     bic_table: pd.DataFrame,
+    preferred_k: int | None = None,
+    selected_k: int | None = None,
     excluded_idx: np.ndarray | None = None,
     dwell_ms: np.ndarray | None = None,
     delta_i: np.ndarray | None = None,
 ) -> bytes:
-    """Package all BIC-selected GMM populations into one ZIP archive."""
+    """Package a BIC-guided, user-selected-K GMM split into one ZIP archive."""
 
     n_components = len(cluster_files)
+    if selected_k is None:
+        selected_k = n_components
+    selected_k = int(selected_k)
+    if preferred_k is None:
+        preferred_k = selected_k
+    preferred_k = int(preferred_k)
     probabilities = np.asarray(probabilities, dtype=float)
     median_dwell_ms = np.asarray(median_dwell_ms, dtype=float)
 
@@ -1384,7 +1406,7 @@ def make_bic_selected_gmm_zip(
                 ]
 
         population_map[
-            "bic_ordered_cluster"
+            "gmm_ordered_cluster"
         ] = cluster_number
 
         maps_with_probabilities.append(population_map)
@@ -1442,7 +1464,7 @@ def make_bic_selected_gmm_zip(
     ) as zf:
 
         for cluster_number, files in enumerate(cluster_files, start=1):
-            population = f"BIC_CLUSTER_{cluster_number}"
+            population = f"GMM_CLUSTER_{cluster_number}"
 
             zf.writestr(
                 f"{population}/{stem}_{population}.event_data.npz",
@@ -1499,12 +1521,13 @@ def make_bic_selected_gmm_zip(
         zf.writestr(
             "split_info.txt",
             (
-                "Nanopore BIC-selected 2D GMM population split\n"
+                "Nanopore BIC-guided 2D GMM population split\n"
                 "Features: log10(dwell time) + ΔI\n"
                 f"ΔI source: {delta_i_name}\n"
                 "Both features were standardized before fitting.\n"
                 "Candidate models used full-covariance Gaussian mixtures.\n"
-                f"BIC-selected number of components: {n_components}\n"
+                f"BIC-preferred number of components: {preferred_k}\n"
+                f"Exported/user-selected number of components: {selected_k}\n"
                 "Clusters are ordered by median ORIGINAL dwell time; Cluster 1 "
                 "has the shortest median dwell. These are statistical cluster "
                 "labels, not assumed physical mechanisms.\n"
@@ -1515,7 +1538,7 @@ def make_bic_selected_gmm_zip(
                 "and event_fitting NPZ files.\n"
                 "Event IDs are re-numbered 0..N-1 inside each cluster.\n"
                 "event_id_mapping.csv preserves original row indices and all "
-                "BIC-selected GMM posterior probabilities.\n"
+                "selected-K GMM posterior probabilities.\n"
                 "bic_model_selection.csv contains the BIC comparison across K.\n"
             ).encode("utf-8"),
         )
@@ -1862,7 +1885,7 @@ def main() -> None:
         "The standard two-component Short-like/Long-like split is retained for "
         "direct comparison, while the optional BIC analysis can choose the "
         "number of Gaussian components and, if requested, show/export that "
-        "BIC-selected multi-population split. The original dwell-only split "
+        "BIC-guided multi-population split with user-selectable K. The original dwell-only split "
         "above is left unchanged."
     )
 
@@ -2006,19 +2029,7 @@ def main() -> None:
                 )
 
     bic_selected_result = None
-
-    if bic2d_result is not None:
-        try:
-            bic_selected_result = build_bic_selected_population_result(
-                bic2d_result,
-                dwell_ms,
-                gmm2d_delta_i,
-            )
-        except Exception as exc:
-            with gmm2d_result_col:
-                st.warning(
-                    f"The BIC-selected population split could not be built: {exc}"
-                )
+    bic_selected_k = None
 
     gmm2d_result = None
 
@@ -2153,13 +2164,59 @@ def main() -> None:
                 "tell us how many physical DNA-translocation mechanisms exist."
             )
 
-            show_bic_selected_split = st.checkbox(
-                "Show the population split from the BIC-selected model",
-                value=True,
-                key="show_bic_selected_split_v144",
+            tested_k_values = [
+                int(value)
+                for value in bic2d_result["table"]["Components (K)"].tolist()
+            ]
+
+            bic_selected_k = st.selectbox(
+                "Choose K for the population split",
+                options=tested_k_values,
+                index=tested_k_values.index(best_k),
+                key="bic_user_selected_k_v145",
                 help=(
-                    "Uses the model with the minimum BIC. For K > 2, the groups are "
-                    "shown as Cluster 1, Cluster 2, ... ordered by median dwell time."
+                    "BIC's preferred K is selected by default. You can choose any "
+                    "K that was tested above; the app will display and export the "
+                    "GMM populations for that chosen K."
+                ),
+            )
+            bic_selected_k = int(bic_selected_k)
+
+            if bic_selected_k == best_k:
+                st.success(
+                    f"Using **K = {bic_selected_k}**, which is the BIC-preferred model."
+                )
+            else:
+                selected_row = bic2d_result["table"].loc[
+                    bic2d_result["table"]["Components (K)"] == bic_selected_k
+                ].iloc[0]
+                st.info(
+                    f"You selected **K = {bic_selected_k}** while BIC prefers "
+                    f"**K = {best_k}**. For the selected model, ΔBIC = "
+                    f"**{float(selected_row['ΔBIC from best']):.1f}**."
+                )
+
+            try:
+                bic_selected_result = build_bic_selected_population_result(
+                    bic2d_result,
+                    dwell_ms,
+                    gmm2d_delta_i,
+                    selected_k=bic_selected_k,
+                )
+            except Exception as exc:
+                bic_selected_result = None
+                st.warning(
+                    f"The selected-K population split could not be built: {exc}"
+                )
+
+            show_bic_selected_split = st.checkbox(
+                "Show the population split for the chosen K",
+                value=True,
+                key="show_bic_selected_split_v145",
+                help=(
+                    "Shows the model for the K chosen above. BIC's preferred K is the "
+                    "default. For K > 2, groups are shown as Cluster 1, Cluster 2, ... "
+                    "ordered by median dwell time."
                 ),
             )
 
@@ -2169,13 +2226,13 @@ def main() -> None:
             ):
 
                 st.markdown(
-                    f"#### BIC-selected population split — K = {best_k}"
+                    f"#### Selected population split — K = {bic_selected_k}"
                 )
 
-                if best_k == 1:
+                if bic_selected_k == 1:
                     st.info(
-                        "BIC selected one Gaussian component, so statistically this "
-                        "model does not split the valid events into multiple clusters."
+                        "K = 1 contains one Gaussian component, so this chosen model "
+                        "does not split the valid events into multiple clusters."
                     )
 
                 bic_counts = bic_selected_result["counts"]
@@ -2187,7 +2244,7 @@ def main() -> None:
                     {
                         "Cluster": [
                             f"Cluster {i + 1}"
-                            for i in range(best_k)
+                            for i in range(bic_selected_k)
                         ],
                         "Events": bic_counts,
                         "% of valid events": (
@@ -2224,9 +2281,9 @@ def main() -> None:
                 )
 
                 bic_plot_log_x = st.toggle(
-                    "Logarithmic dwell-time axis for BIC-selected split",
+                    "Logarithmic dwell-time axis for selected-K split",
                     value=False,
-                    key="bic_selected_plot_log_x_v144",
+                    key="bic_selected_plot_log_x_v145",
                 )
 
                 bic_valid_idx = bic_selected_result["valid_idx"]
@@ -2295,7 +2352,7 @@ def main() -> None:
                     figsize=(9, 5.4)
                 )
 
-                for cluster in range(best_k):
+                for cluster in range(bic_selected_k):
                     cluster_idx = bic_selected_result[
                         "cluster_indices"
                     ][cluster]
@@ -2311,10 +2368,10 @@ def main() -> None:
                         ),
                     )
 
-                if best_k > 1:
+                if bic_selected_k > 1:
                     boundary_levels = np.arange(
                         0.5,
-                        best_k - 0.5,
+                        bic_selected_k - 0.5,
                         1.0,
                     )
 
@@ -2333,7 +2390,7 @@ def main() -> None:
                 ax_bic_split.set_xlabel("Dwell time (ms)")
                 ax_bic_split.set_ylabel(gmm2d_delta_i_name)
                 ax_bic_split.set_title(
-                    f"BIC-selected 2D GMM classification (K = {best_k})"
+                    f"Selected-K 2D GMM classification (K = {bic_selected_k})"
                 )
                 ax_bic_split.legend()
                 fig_bic_split.tight_layout()
@@ -2344,7 +2401,7 @@ def main() -> None:
                 )
 
                 st.caption(
-                    "The point colours show the populations from the minimum-BIC "
+                    "The point colours show the populations from the chosen-K model. "
                     "model. Clusters are numbered from shortest to longest median "
                     "dwell time. Dashed contours mark changes in the most-probable "
                     "Gaussian component; for K > 2 there is no single universal "
@@ -3726,8 +3783,8 @@ def main() -> None:
 
     st.write(
         "Choose whether the exported populations are defined by the original "
-        "1D dwell-time cutoff, the fixed two-component 2D GMM, or the "
-        "BIC-selected 2D GMM. Every exported population keeps event_data, "
+        "1D dwell-time cutoff, the fixed two-component 2D GMM, or a "
+        "BIC-guided user-selected-K 2D GMM. Every exported population keeps event_data, "
         "dataset, and event_fitting synchronized."
     )
 
@@ -3736,10 +3793,10 @@ def main() -> None:
         [
             "1D dwell-time split",
             "2D GMM: fixed K = 2",
-            "2D GMM: BIC-selected K",
+            "2D GMM: selected K after BIC",
         ],
         horizontal=True,
-        key="export_population_definition_v144",
+        key="export_population_definition_v145",
     )
 
     default_stem = clean_stem(
@@ -3837,14 +3894,14 @@ def main() -> None:
 
         if not run_bic_selection or bic_selected_result is None:
             st.warning(
-                "Run the BIC component-number check above before exporting the "
-                "BIC-selected populations."
+                "Run the BIC component-number check above and choose K before "
+                "exporting the selected-K populations."
             )
             export_ready = False
 
         elif bic_selected_result["n_components"] < 2:
             st.info(
-                "BIC selected K = 1, so there is no multi-population split to export."
+                "The chosen K = 1 has no multi-population split to export."
             )
             export_ready = False
 
@@ -3867,13 +3924,13 @@ def main() -> None:
                 st.warning(
                     f"{n_unclassified_bic:,} of {n_events:,} events "
                     f"({excluded_fraction:.3f}%) cannot be classified by the "
-                    "BIC-selected 2D GMM because dwell time and/or ΔI is invalid."
+                    "selected-K 2D GMM because dwell time and/or ΔI is invalid."
                 )
 
                 exclude_unclassified_bic = st.checkbox(
-                    "Exclude unclassifiable events from the BIC-selected split and continue",
+                    "Exclude unclassifiable events from the selected-K split and continue",
                     value=False,
-                    key="allow_bic_unclassified_exclusion_v144",
+                    key="allow_bic_unclassified_exclusion_v145",
                 )
 
                 if not exclude_unclassified_bic:
@@ -3881,22 +3938,22 @@ def main() -> None:
 
             if any(len(idx) == 0 for idx in export_cluster_indices):
                 st.warning(
-                    "At least one BIC-selected cluster is empty, so the split cannot be exported."
+                    "At least one selected-K cluster is empty, so the split cannot be exported."
                 )
                 export_ready = False
 
             if export_ready:
                 st.caption(
-                    f"BIC-selected export will create **{len(export_cluster_indices)} "
+                    f"Selected-K export will create **{len(export_cluster_indices)} "
                     "synchronized population folders**, ordered from shortest to "
                     "longest median dwell time."
                 )
 
     # Use new version-specific session keys so stale state cannot leak across
     # deployments or between the two-component and BIC-selected export modes.
-    result_zip_key = "result_zip_v144bic"
-    result_name_key = "result_name_v144bic"
-    result_message_key = "result_message_v144bic"
+    result_zip_key = "result_zip_v145selectedk"
+    result_name_key = "result_name_v145selectedk"
+    result_message_key = "result_message_v145selectedk"
 
     if st.button(
         "Build filtered files",
@@ -3904,12 +3961,12 @@ def main() -> None:
         disabled=not export_ready,
     ):
 
-        if export_method == "2D GMM: BIC-selected K":
+        if export_method == "2D GMM: selected K after BIC":
 
             n_clusters = len(export_cluster_indices)
             progress = st.progress(
                 0,
-                text="Building BIC-selected populations...",
+                text="Building selected-K populations...",
             )
 
             bic_cluster_files = []
@@ -3919,7 +3976,7 @@ def main() -> None:
                 export_cluster_indices,
                 start=1,
             ):
-                cluster_label = f"BIC_CLUSTER_{cluster_number}"
+                cluster_label = f"GMM_CLUSTER_{cluster_number}"
 
                 cluster_files, cluster_map = build_filtered_files(
                     cluster_idx,
@@ -3941,7 +3998,7 @@ def main() -> None:
 
             progress.progress(
                 85,
-                text="Packing BIC-selected ZIP...",
+                text="Packing selected-K ZIP...",
             )
 
             zip_bytes = make_bic_selected_gmm_zip(
@@ -3952,13 +4009,15 @@ def main() -> None:
                 bic_selected_result["probabilities"],
                 bic_selected_result["median_dwell_ms"],
                 bic2d_result["table"],
+                preferred_k=int(bic2d_result["best_k"]),
+                selected_k=int(bic_selected_result["n_components"]),
                 excluded_idx=export_excluded_idx,
                 dwell_ms=dwell_ms,
                 delta_i=gmm2d_delta_i,
             )
 
             result_name = (
-                f"{stem}_2D_GMM_BIC_K{n_clusters}_split.zip"
+                f"{stem}_2D_GMM_selected_K{n_clusters}_split.zip"
             )
 
             count_text = " + ".join(
@@ -3966,9 +4025,16 @@ def main() -> None:
                 for i, idx in enumerate(export_cluster_indices)
             )
 
+            preferred_k = int(bic2d_result["best_k"])
+            selection_note = (
+                "BIC-preferred"
+                if n_clusters == preferred_k
+                else f"user-selected (BIC preferred K = {preferred_k})"
+            )
+
             result_message = (
-                f"Ready: {count_text} using the **BIC-selected K = {n_clusters}** "
-                f"model in **log10(dwell time) + {gmm2d_delta_i_name}** space."
+                f"Ready: {count_text} using **K = {n_clusters}** ({selection_note}) "
+                f"in **log10(dwell time) + {gmm2d_delta_i_name}** space."
             )
 
             if len(export_excluded_idx):
