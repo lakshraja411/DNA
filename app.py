@@ -24,7 +24,7 @@ from splitter_core import (
 )
 
 
-APP_VERSION = "1.4.2-mpl-exclusions"
+APP_VERSION = "1.4.3-bic-model-selection"
 
 
 # ============================================================
@@ -765,6 +765,119 @@ def apply_axis_limits(
 # ============================================================
 
 
+def select_2d_gmm_components_bic(
+    dwell_ms: np.ndarray,
+    delta_i: np.ndarray,
+    max_components: int = 5,
+):
+    """
+    Compare 1..max_components full-covariance 2D GMMs using BIC.
+
+    Every candidate model uses exactly the same preprocessing as the main
+    2D GMM: [log10(dwell time), delta-I] followed by StandardScaler.
+
+    Lower BIC is better. The returned best_k is the number of Gaussian
+    components with the minimum BIC. This is a statistical model-selection
+    diagnostic; it does not by itself prove that the same number of physical
+    nanopore mechanisms exists.
+    """
+
+    dwell_ms = np.asarray(dwell_ms, dtype=float)
+    delta_i = np.asarray(delta_i, dtype=float)
+
+    valid = (
+        np.isfinite(dwell_ms)
+        & (dwell_ms > 0)
+        & np.isfinite(delta_i)
+    )
+
+    valid_idx = np.flatnonzero(valid)
+
+    if len(valid_idx) < 20:
+        raise ValueError(
+            "At least 20 events with finite dwell time and ΔI are required "
+            "for BIC model selection."
+        )
+
+    features = np.column_stack(
+        [
+            np.log10(dwell_ms[valid_idx]),
+            delta_i[valid_idx],
+        ]
+    )
+
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+
+    max_components = int(max(1, max_components))
+    max_components = min(
+        max_components,
+        max(1, len(valid_idx) // 5),
+    )
+
+    rows = []
+    models = {}
+
+    for k in range(1, max_components + 1):
+
+        model = GaussianMixture(
+            n_components=k,
+            covariance_type="full",
+            random_state=0,
+            n_init=10,
+            reg_covar=1e-6,
+        )
+
+        model.fit(features_scaled)
+
+        bic_value = float(
+            model.bic(features_scaled)
+        )
+
+        rows.append(
+            {
+                "Components (K)": k,
+                "BIC": bic_value,
+            }
+        )
+
+        models[k] = model
+
+    table = pd.DataFrame(rows)
+
+    best_row = int(
+        table["BIC"].idxmin()
+    )
+
+    best_k = int(
+        table.loc[
+            best_row,
+            "Components (K)",
+        ]
+    )
+
+    min_bic = float(
+        table.loc[
+            best_row,
+            "BIC",
+        ]
+    )
+
+    table["ΔBIC from best"] = (
+        table["BIC"]
+        - min_bic
+    )
+
+    return {
+        "table": table,
+        "best_k": best_k,
+        "best_model": models[best_k],
+        "scaler": scaler,
+        "valid": valid,
+        "valid_idx": valid_idx,
+    }
+
+
 def fit_2d_gmm(
     dwell_ms: np.ndarray,
     delta_i: np.ndarray,
@@ -1452,8 +1565,10 @@ def main() -> None:
     )
 
     st.caption(
-        "This is a second, independent population definition. "
-        "It fits a two-component GMM to log10(dwell time) and ΔI. "
+        "This section analyses populations in log10(dwell time) + ΔI space. "
+        "The main Short-like/Long-like split still uses two components for "
+        "direct comparison and export, while the optional BIC check can ask "
+        "how many Gaussian components the data statistically prefer. "
         "The original dwell-only Short/Long split above is left unchanged."
     )
 
@@ -1543,6 +1658,59 @@ def main() -> None:
             "are standardized, changing nA to pA would not change the assignments."
         )
 
+        st.divider()
+
+        run_bic_selection = st.checkbox(
+            "Check how many 2D Gaussian components BIC prefers",
+            value=False,
+            key="run_2d_bic_selection_v143",
+            help=(
+                "Fits K = 1 up to the selected maximum using the same "
+                "log10(dwell) + ΔI preprocessing. Lower BIC is better. "
+                "This is exploratory model selection and does not prove the "
+                "same number of physical nanopore mechanisms."
+            ),
+        )
+
+        bic_max_components = st.slider(
+            "Maximum number of components to test",
+            min_value=2,
+            max_value=6,
+            value=5,
+            step=1,
+            key="bic_max_components_v143",
+            disabled=not run_bic_selection,
+        )
+
+        st.caption(
+            "BIC adds a penalty for extra model complexity, so it does not "
+            "automatically reward adding more and more Gaussian components."
+        )
+
+    bic2d_result = None
+
+    if run_bic_selection:
+
+        try:
+
+            with st.spinner(
+                "Comparing 2D GMMs with BIC..."
+            ):
+
+                bic2d_result = select_2d_gmm_components_bic(
+                    dwell_ms,
+                    gmm2d_delta_i,
+                    max_components=bic_max_components,
+                )
+
+        except Exception as exc:
+
+            with gmm2d_result_col:
+
+                st.warning(
+                    f"BIC model selection could not be completed: {exc}"
+                )
+
     gmm2d_result = None
 
     try:
@@ -1558,6 +1726,125 @@ def main() -> None:
             st.warning(
                 f"2D GMM could not be fitted: {exc}"
             )
+
+    if bic2d_result is not None:
+
+        with gmm2d_result_col:
+
+            best_k = int(
+                bic2d_result["best_k"]
+            )
+
+            st.markdown(
+                "#### BIC component-number check"
+            )
+
+            st.metric(
+                "BIC-preferred number of Gaussian components",
+                f"K = {best_k}",
+            )
+
+            if best_k == 1:
+
+                st.info(
+                    "BIC prefers one Gaussian component in this 2D feature space. "
+                    "A forced two-component split may therefore be over-splitting "
+                    "a single statistical population."
+                )
+
+            elif best_k == 2:
+
+                st.success(
+                    "BIC prefers two Gaussian components. This supports using the "
+                    "current two-component 2D GMM as the simplest preferred model."
+                )
+
+            else:
+
+                st.warning(
+                    f"BIC prefers **{best_k} Gaussian components**. The current "
+                    "Short-like/Long-like analysis below still intentionally fits "
+                    "two components for a directly comparable two-population split. "
+                    "The BIC result says that two Gaussians may be an oversimplified "
+                    "statistical description of this dataset."
+                )
+
+            with st.expander(
+                "Show BIC values and plot",
+                expanded=True,
+            ):
+
+                bic_table = bic2d_result[
+                    "table"
+                ].copy()
+
+                st.dataframe(
+                    bic_table.style.format(
+                        {
+                            "BIC": "{:.1f}",
+                            "ΔBIC from best": "{:.1f}",
+                        }
+                    ),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+                fig_bic, ax_bic = plt.subplots(
+                    figsize=(6.6, 4.0)
+                )
+
+                ax_bic.plot(
+                    bic_table["Components (K)"],
+                    bic_table["BIC"],
+                    marker="o",
+                    linewidth=1.8,
+                )
+
+                ax_bic.axvline(
+                    best_k,
+                    linestyle="--",
+                    linewidth=1.4,
+                    label=f"Minimum BIC: K = {best_k}",
+                )
+
+                ax_bic.set_xlabel(
+                    "Number of Gaussian components (K)"
+                )
+
+                ax_bic.set_ylabel(
+                    "BIC"
+                )
+
+                ax_bic.set_title(
+                    "2D GMM model selection by BIC"
+                )
+
+                ax_bic.set_xticks(
+                    bic_table["Components (K)"]
+                )
+
+                ax_bic.legend()
+
+                fig_bic.tight_layout()
+
+                st.pyplot(
+                    fig_bic,
+                    clear_figure=True,
+                )
+
+                st.caption(
+                    "Lower BIC is better. ΔBIC is measured relative to the best "
+                    "candidate model. The comparison uses the same standardized "
+                    "[log10(dwell time), ΔI] feature space as the 2D GMM."
+                )
+
+            st.caption(
+                "Important: BIC chooses the number of Gaussian components that "
+                "best balances fit and model complexity. It does not by itself "
+                "tell us how many physical DNA-translocation mechanisms exist."
+            )
+
+            st.divider()
 
     if gmm2d_result is not None:
 
