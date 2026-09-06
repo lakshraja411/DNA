@@ -24,7 +24,7 @@ from splitter_core import (
 )
 
 
-APP_VERSION = "1.4.5-bic-user-selected-k"
+APP_VERSION = "1.4.6-bic-mean-stats"
 
 
 # ============================================================
@@ -985,6 +985,25 @@ def build_bic_selected_population_result(
         dtype=int,
     )
 
+    # Descriptive statistics calculated directly from the ORIGINAL events
+    # assigned to each selected-K cluster. These are different from the GMM
+    # component centres, which are model parameters in log-dwell + ΔI space.
+    mean_dwell_ms = np.asarray(
+        [
+            float(np.mean(dwell_ms[idx])) if len(idx) else np.nan
+            for idx in cluster_indices
+        ],
+        dtype=float,
+    )
+
+    mean_delta_i = np.asarray(
+        [
+            float(np.mean(delta_i[idx])) if len(idx) else np.nan
+            for idx in cluster_indices
+        ],
+        dtype=float,
+    )
+
     assignment_probability = np.max(
         probabilities[valid_idx, :],
         axis=1,
@@ -1003,6 +1022,8 @@ def build_bic_selected_population_result(
         "cluster_indices": cluster_indices,
         "counts": counts,
         "median_dwell_ms": median_dwell_ms,
+        "mean_dwell_ms": mean_dwell_ms,
+        "mean_delta_i": mean_delta_i,
         "centre_dwell_ms": centre_dwell_ms,
         "centre_delta_i": centre_delta_i,
         "assignment_probability": assignment_probability,
@@ -2237,8 +2258,8 @@ def main() -> None:
 
                 bic_counts = bic_selected_result["counts"]
                 bic_medians = bic_selected_result["median_dwell_ms"]
-                bic_centres_dwell = bic_selected_result["centre_dwell_ms"]
-                bic_centres_delta = bic_selected_result["centre_delta_i"]
+                bic_means_dwell = bic_selected_result["mean_dwell_ms"]
+                bic_means_delta = bic_selected_result["mean_delta_i"]
 
                 bic_population_table = pd.DataFrame(
                     {
@@ -2251,8 +2272,8 @@ def main() -> None:
                             100.0 * bic_counts / np.sum(bic_counts)
                         ),
                         "Median dwell (ms)": bic_medians,
-                        "GMM centre dwell (ms)": bic_centres_dwell,
-                        "GMM centre ΔI": bic_centres_delta,
+                        "Mean dwell (ms)": bic_means_dwell,
+                        "Mean ΔI (nA)": bic_means_delta,
                     }
                 )
 
@@ -2261,8 +2282,8 @@ def main() -> None:
                         {
                             "% of valid events": "{:.1f}",
                             "Median dwell (ms)": "{:.4f}",
-                            "GMM centre dwell (ms)": "{:.4f}",
-                            "GMM centre ΔI": "{:.4g}",
+                            "Mean dwell (ms)": "{:.4f}",
+                            "Mean ΔI (nA)": "{:.4g}",
                         }
                     ),
                     hide_index=True,
