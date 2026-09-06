@@ -24,7 +24,7 @@ from splitter_core import (
 )
 
 
-APP_VERSION = "1.4.8-similarity-topology-reclassification"
+APP_VERSION = "1.4.6-bic-mean-stats"
 
 
 # ============================================================
@@ -135,112 +135,6 @@ def derive_event_metrics(event_fitting: dict[str, np.ndarray], n_events: int):
         "Number of segments":
             number_of_segments,
     }
-
-
-
-def _segment_similarity_percent(a: float, b: float) -> float:
-    """Return blockade-amplitude similarity on a bounded 0..100% scale.
-
-    Similarity = 100 * min(|a|, |b|) / max(|a|, |b|).
-    Therefore 100% means identical magnitudes. The absolute values are used so
-    the result is independent of the sign convention used for segment_mean_diffs.
-    """
-
-    a = abs(float(a))
-    b = abs(float(b))
-
-    high = max(a, b)
-    low = min(a, b)
-
-    if high <= 1e-15:
-        return 100.0
-
-    return 100.0 * low / high
-
-
-def reclassify_segment_counts_by_similarity(
-    event_fitting: dict[str, np.ndarray],
-    n_events: int,
-    similarity_threshold_percent: float,
-) -> np.ndarray:
-    """Recalculate an effective segment count after merging similar neighbours.
-
-    Adjacent fitted segments are compared in their original temporal order using
-    the magnitude of SEGMENT_INFO_i_segment_mean_diffs. Two neighbouring segment
-    groups are merged when their amplitude similarity is greater than or equal to
-    ``similarity_threshold_percent``. If segment widths are available, merged
-    amplitudes are duration-weighted; otherwise equal weights are used.
-
-    This is a post-processing sensitivity analysis only. It does not change the
-    NanoSense fit, GMM cluster assignment, or exported source event data.
-    """
-
-    threshold = float(np.clip(similarity_threshold_percent, 0.0, 100.0))
-    reclassified = np.full(n_events, np.nan, dtype=float)
-
-    for i in range(n_events):
-        diff_key = f"SEGMENT_INFO_{i}_segment_mean_diffs"
-        width_key = f"SEGMENT_INFO_{i}_segment_widths_time"
-        n_key = f"SEGMENT_INFO_{i}_number_of_segments"
-
-        # If the fitting file explicitly says this is a one-segment event, no
-        # amplitude-comparison step is required.
-        stored_n = np.array([], dtype=float)
-        if n_key in event_fitting:
-            stored_n = np.asarray(event_fitting[n_key], dtype=float).ravel()
-            if stored_n.size and np.isfinite(stored_n[0]) and int(round(stored_n[0])) <= 1:
-                reclassified[i] = 1.0
-                continue
-
-        if diff_key not in event_fitting:
-            continue
-
-        diffs = np.asarray(event_fitting[diff_key], dtype=float).ravel()
-        if diffs.size == 0:
-            continue
-
-        # Preserve the temporal order. For a multi-segment event, require all
-        # segment amplitudes to be finite so that we do not accidentally bridge
-        # across an unknown segment.
-        if not np.all(np.isfinite(diffs)):
-            continue
-
-        amplitudes = np.abs(diffs)
-
-        if width_key in event_fitting:
-            widths = np.asarray(event_fitting[width_key], dtype=float).ravel()
-        else:
-            widths = np.ones_like(amplitudes, dtype=float)
-
-        if len(widths) != len(amplitudes) or not np.all(np.isfinite(widths)):
-            widths = np.ones_like(amplitudes, dtype=float)
-        else:
-            widths = np.where(widths > 0, widths, 1.0)
-
-        # Sequentially merge only adjacent segments. After a merge, compare the
-        # next segment against the duration-weighted amplitude of the current group.
-        effective_count = 1
-        current_amp = float(amplitudes[0])
-        current_weight = float(widths[0])
-
-        for next_amp, next_weight in zip(amplitudes[1:], widths[1:]):
-            similarity = _segment_similarity_percent(current_amp, float(next_amp))
-
-            if similarity >= threshold:
-                total_weight = current_weight + float(next_weight)
-                current_amp = (
-                    current_amp * current_weight
-                    + float(next_amp) * float(next_weight)
-                ) / total_weight
-                current_weight = total_weight
-            else:
-                effective_count += 1
-                current_amp = float(next_amp)
-                current_weight = float(next_weight)
-
-        reclassified[i] = float(effective_count)
-
-    return reclassified
 
 
 @st.cache_resource(show_spinner=False)
@@ -2366,7 +2260,6 @@ def main() -> None:
                 bic_medians = bic_selected_result["median_dwell_ms"]
                 bic_means_dwell = bic_selected_result["mean_dwell_ms"]
                 bic_means_delta = bic_selected_result["mean_delta_i"]
-                bic_cluster_indices = bic_selected_result["cluster_indices"]
 
                 bic_population_table = pd.DataFrame(
                     {
@@ -2396,144 +2289,6 @@ def main() -> None:
                     hide_index=True,
                     use_container_width=True,
                 )
-
-                # ------------------------------------------------------------
-                # OPTIONAL POST-CLUSTERING TOPOLOGY RECLASSIFICATION
-                # ------------------------------------------------------------
-                st.markdown(
-                    "#### Optional segment-topology reclassification"
-                )
-
-                st.caption(
-                    "This is a post-clustering sensitivity analysis. It does not "
-                    "change the GMM clusters. Instead, it re-examines the fitted "
-                    "segments within each event and merges neighbouring segments "
-                    "whose blockade amplitudes are sufficiently similar."
-                )
-
-                run_similarity_reclassification = st.checkbox(
-                    "Reclassify segment counts using a ΔI similarity threshold",
-                    value=False,
-                    key="run_similarity_topology_reclassification_v148",
-                )
-
-                if run_similarity_reclassification:
-                    similarity_threshold = st.slider(
-                        "Adjacent-segment ΔI similarity threshold (%)",
-                        min_value=0,
-                        max_value=100,
-                        value=80,
-                        step=1,
-                        key="segment_similarity_threshold_v148",
-                        help=(
-                            "Similarity is 100 × min(|ΔI₁|, |ΔI₂|) / "
-                            "max(|ΔI₁|, |ΔI₂|). Adjacent segments are merged when "
-                            "their similarity is at least this threshold. A lower "
-                            "threshold merges more segments; a higher threshold is "
-                            "more conservative."
-                        ),
-                    )
-
-                    st.latex(
-                        r"S(\Delta I_a,\Delta I_b)="
-                        r"100\,\frac{\min(|\Delta I_a|,|\Delta I_b|)}"
-                        r"{\max(|\Delta I_a|,|\Delta I_b|)}"
-                    )
-
-                    st.caption(
-                        f"At the current threshold of {similarity_threshold}%, "
-                        "two adjacent segment levels are merged when their blockade "
-                        "magnitudes have at least that similarity. After merging, "
-                        "linear = 1 effective segment, folded = 2, and complex = 3 or more."
-                    )
-
-                    original_segment_counts = np.asarray(
-                        derived_metrics["Number of segments"],
-                        dtype=float,
-                    )
-
-                    reclassified_segment_counts = (
-                        reclassify_segment_counts_by_similarity(
-                            event_fitting,
-                            n_events,
-                            similarity_threshold,
-                        )
-                    )
-
-                    topology_rows = []
-
-                    for cluster_number, idx in enumerate(
-                        bic_cluster_indices,
-                        start=1,
-                    ):
-                        original_values = original_segment_counts[idx]
-                        reclassified_values = reclassified_segment_counts[idx]
-
-                        original_values = original_values[
-                            np.isfinite(original_values)
-                        ]
-                        reclassified_values = reclassified_values[
-                            np.isfinite(reclassified_values)
-                        ]
-
-                        if len(original_values):
-                            original_mean = float(np.mean(original_values))
-                        else:
-                            original_mean = np.nan
-
-                        if len(reclassified_values):
-                            reclassified_mean = float(np.mean(reclassified_values))
-                            pct_linear = 100.0 * float(
-                                np.mean(reclassified_values == 1)
-                            )
-                            pct_folded = 100.0 * float(
-                                np.mean(reclassified_values == 2)
-                            )
-                            pct_complex = 100.0 * float(
-                                np.mean(reclassified_values >= 3)
-                            )
-                        else:
-                            reclassified_mean = np.nan
-                            pct_linear = np.nan
-                            pct_folded = np.nan
-                            pct_complex = np.nan
-
-                        topology_rows.append(
-                            {
-                                "Cluster": f"Cluster {cluster_number}",
-                                "Events in GMM cluster": len(idx),
-                                "Events with usable segment amplitudes": len(reclassified_values),
-                                "Mean original no. segments": original_mean,
-                                "Mean reclassified no. segments": reclassified_mean,
-                                "% linear after reclassification": pct_linear,
-                                "% folded after reclassification": pct_folded,
-                                "% complex after reclassification": pct_complex,
-                            }
-                        )
-
-                    topology_table = pd.DataFrame(topology_rows)
-
-                    st.dataframe(
-                        topology_table.style.format(
-                            {
-                                "Mean original no. segments": "{:.2f}",
-                                "Mean reclassified no. segments": "{:.2f}",
-                                "% linear after reclassification": "{:.1f}",
-                                "% folded after reclassification": "{:.1f}",
-                                "% complex after reclassification": "{:.1f}",
-                            }
-                        ),
-                        hide_index=True,
-                        use_container_width=True,
-                    )
-
-                    st.caption(
-                        "Only adjacent fitted segments are considered for merging. "
-                        "Merged segment amplitudes are duration-weighted when valid "
-                        "segment widths are available. Events with unusable segment "
-                        "amplitudes remain in their GMM cluster but are omitted from "
-                        "the reclassified topology percentages."
-                    )
 
                 bic_assignment_probability = bic_selected_result[
                     "assignment_probability"
