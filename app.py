@@ -24,7 +24,7 @@ from splitter_core import (
 )
 
 
-APP_VERSION = "1.4.6-bic-mean-stats"
+APP_VERSION = "1.4.7-bic-cluster-topology-stats"
 
 
 # ============================================================
@@ -2260,6 +2260,56 @@ def main() -> None:
                 bic_medians = bic_selected_result["median_dwell_ms"]
                 bic_means_dwell = bic_selected_result["mean_dwell_ms"]
                 bic_means_delta = bic_selected_result["mean_delta_i"]
+                bic_cluster_indices = bic_selected_result["cluster_indices"]
+
+                # Segment-derived descriptive statistics for each selected-K cluster.
+                # These values are NOT used by the GMM; they are calculated only
+                # after clustering from event_fitting and therefore provide an
+                # additional description of each statistical event population.
+                segment_counts_all = np.asarray(
+                    derived_metrics["Number of segments"],
+                    dtype=float,
+                )
+
+                bic_mean_segments = []
+                bic_pct_linear = []
+                bic_pct_folded = []
+                bic_pct_complex = []
+                bic_segment_valid_n = []
+
+                for idx in bic_cluster_indices:
+                    cluster_segments = segment_counts_all[idx]
+                    cluster_segments = cluster_segments[
+                        np.isfinite(cluster_segments)
+                    ]
+
+                    n_segment_valid = len(cluster_segments)
+                    bic_segment_valid_n.append(n_segment_valid)
+
+                    if n_segment_valid:
+                        bic_mean_segments.append(
+                            float(np.mean(cluster_segments))
+                        )
+                        bic_pct_linear.append(
+                            100.0 * np.mean(cluster_segments == 1)
+                        )
+                        bic_pct_folded.append(
+                            100.0 * np.mean(cluster_segments == 2)
+                        )
+                        bic_pct_complex.append(
+                            100.0 * np.mean(cluster_segments >= 3)
+                        )
+                    else:
+                        bic_mean_segments.append(np.nan)
+                        bic_pct_linear.append(np.nan)
+                        bic_pct_folded.append(np.nan)
+                        bic_pct_complex.append(np.nan)
+
+                bic_mean_segments = np.asarray(bic_mean_segments, dtype=float)
+                bic_pct_linear = np.asarray(bic_pct_linear, dtype=float)
+                bic_pct_folded = np.asarray(bic_pct_folded, dtype=float)
+                bic_pct_complex = np.asarray(bic_pct_complex, dtype=float)
+                bic_segment_valid_n = np.asarray(bic_segment_valid_n, dtype=int)
 
                 bic_population_table = pd.DataFrame(
                     {
@@ -2274,6 +2324,10 @@ def main() -> None:
                         "Median dwell (ms)": bic_medians,
                         "Mean dwell (ms)": bic_means_dwell,
                         "Mean ΔI (nA)": bic_means_delta,
+                        "Mean no. of segments": bic_mean_segments,
+                        "% linear (1 segment)": bic_pct_linear,
+                        "% folded (2 segments)": bic_pct_folded,
+                        "% complex (≥3 segments)": bic_pct_complex,
                     }
                 )
 
@@ -2284,11 +2338,29 @@ def main() -> None:
                             "Median dwell (ms)": "{:.4f}",
                             "Mean dwell (ms)": "{:.4f}",
                             "Mean ΔI (nA)": "{:.4g}",
+                            "Mean no. of segments": "{:.2f}",
+                            "% linear (1 segment)": "{:.1f}",
+                            "% folded (2 segments)": "{:.1f}",
+                            "% complex (≥3 segments)": "{:.1f}",
                         }
                     ),
                     hide_index=True,
                     use_container_width=True,
                 )
+
+                if np.any(bic_segment_valid_n < bic_counts):
+                    st.caption(
+                        "Topology percentages and mean segment number are calculated "
+                        "from events with a finite segment count in event_fitting. "
+                        "Events with missing segment counts are excluded only from "
+                        "these descriptive topology statistics, not from the GMM clusters."
+                    )
+                else:
+                    st.caption(
+                        "Segment-derived topology: linear = 1 segment, folded = 2 segments, "
+                        "complex = 3 or more segments. These topology labels are descriptive "
+                        "and are not used to fit the GMM."
+                    )
 
                 bic_assignment_probability = bic_selected_result[
                     "assignment_probability"
