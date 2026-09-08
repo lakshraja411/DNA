@@ -1,4200 +1,683 @@
-"""Streamlit interface for the Nanopore Event Population Splitter."""
-
+"""Nanopore Studio — BIC-guided event population analysis."""
 from __future__ import annotations
 
+import hashlib
 import io
-import zipfile
+import re
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import streamlit as st
-from sklearn.mixture import GaussianMixture
-from sklearn.neighbors import KernelDensity
-from sklearn.preprocessing import StandardScaler
 from scipy.stats import gaussian_kde
 
-from splitter_core import (
-    auto_cutoff_gmm,
-    build_filtered_files,
-    clean_stem,
-    load_npz_bytes,
-    make_zip,
-    validate_inputs,
+from nanopore_engine import (
+    build_bic_selected_population_result,
+    descriptive_table,
+    derive_event_metrics,
+    event_assignment_table,
+    export_bundle,
+    read_sources,
+    reclassify_segment_counts_by_similarity,
+    select_2d_gmm_components_bic,
+    topology_statistics,
+)
+from splitter_core import clean_stem
+
+VERSION = "2.0.0"
+COLORS = [
+    "#3CB8AE", "#E9A55D", "#8B8BEA", "#5D9FE6", "#E27586",
+    "#83B966", "#C78CCC", "#D5BD65", "#67B9D5", "#AD9F93",
+]
+
+st.set_page_config(
+    page_title="Nanopore Studio",
+    page_icon="🧬",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-
-APP_VERSION = "1.4.6-bic-mean-stats"
-
-
-# ============================================================
-# DATA LOADING / DERIVED METRICS
-# ============================================================
-
-
-def derive_event_metrics(event_fitting: dict[str, np.ndarray], n_events: int):
-    """Derive useful per-event plotting metrics from event_fitting."""
-
-    peak_segment_delta_i = np.full(n_events, np.nan, dtype=float)
-    weighted_segment_delta_i = np.full(n_events, np.nan, dtype=float)
-    number_of_segments = np.full(n_events, np.nan, dtype=float)
-
-    for i in range(n_events):
-
-        diff_key = f"SEGMENT_INFO_{i}_segment_mean_diffs"
-        width_key = f"SEGMENT_INFO_{i}_segment_widths_time"
-        n_key = f"SEGMENT_INFO_{i}_number_of_segments"
-
-        # ----------------------------------------------------
-        # PEAK SEGMENT ΔI
-        # ----------------------------------------------------
-
-        if diff_key in event_fitting:
-
-            diffs = np.asarray(
-                event_fitting[diff_key],
-                dtype=float,
-            ).ravel()
-
-            diffs = diffs[np.isfinite(diffs)]
-
-            if diffs.size:
-                peak_segment_delta_i[i] = float(np.max(diffs))
-
-        # ----------------------------------------------------
-        # TIME-WEIGHTED ΔI
-        # ----------------------------------------------------
-
-        if diff_key in event_fitting and width_key in event_fitting:
-
-            diffs = np.asarray(
-                event_fitting[diff_key],
-                dtype=float,
-            ).ravel()
-
-            widths = np.asarray(
-                event_fitting[width_key],
-                dtype=float,
-            ).ravel()
-
-            n_pair = min(
-                len(diffs),
-                len(widths),
-            )
-
-            diffs = diffs[:n_pair]
-            widths = widths[:n_pair]
-
-            valid = (
-                np.isfinite(diffs)
-                & np.isfinite(widths)
-                & (widths > 0)
-            )
-
-            if np.any(valid):
-
-                total_width = float(
-                    np.sum(widths[valid])
-                )
-
-                if total_width > 0:
-
-                    weighted_segment_delta_i[i] = float(
-                        np.sum(
-                            diffs[valid]
-                            * widths[valid]
-                        )
-                        / total_width
-                    )
-
-        # ----------------------------------------------------
-        # NUMBER OF SEGMENTS
-        # ----------------------------------------------------
-
-        if n_key in event_fitting:
-
-            value = np.asarray(
-                event_fitting[n_key],
-                dtype=float,
-            ).ravel()
-
-            if value.size and np.isfinite(value[0]):
-
-                number_of_segments[i] = float(
-                    value[0]
-                )
-
-    return {
-
-        "Peak segment ΔI":
-            peak_segment_delta_i,
-
-        "Time-weighted segment ΔI":
-            weighted_segment_delta_i,
-
-        "Number of segments":
-            number_of_segments,
-    }
-
-
-@st.cache_resource(show_spinner=False)
-def load_three_files(
-    event_data_bytes: bytes,
-    dataset_bytes: bytes,
-    event_fitting_bytes: bytes,
-):
-    """Cache NPZ parsing and derived metrics."""
-
-    event_data = load_npz_bytes(
-        event_data_bytes
-    )
-
-    dataset = load_npz_bytes(
-        dataset_bytes
-    )
-
-    event_fitting = load_npz_bytes(
-        event_fitting_bytes
-    )
-
-    n_events = len(
-        np.asarray(dataset["X"])
-    )
-
-    derived_metrics = derive_event_metrics(
-        event_fitting,
-        n_events,
-    )
-
-    return (
-        event_data,
-        dataset,
-        event_fitting,
-        derived_metrics,
-    )
-
-
-# ============================================================
-# KDE FUNCTIONS
-# ============================================================
-
-
-def silverman_bandwidth(
-    values: np.ndarray,
-) -> float:
-    """Return robust automatic KDE bandwidth."""
-
-    values = np.asarray(
-        values,
-        dtype=float,
-    )
-
-    values = values[
-        np.isfinite(values)
-    ]
-
-    if len(values) < 2:
-        return 0.1
-
-    std = float(
-        np.std(
-            values,
-            ddof=1,
-        )
-    )
-
-    q25, q75 = np.percentile(
-        values,
-        [25, 75],
-    )
-
-    if q75 > q25:
-
-        iqr_sigma = float(
-            (q75 - q25)
-            / 1.349
-        )
-
-    else:
-
-        iqr_sigma = np.nan
-
-    candidates = [
-
-        value
-
-        for value in (
-            std,
-            iqr_sigma,
-        )
-
-        if (
-            np.isfinite(value)
-            and value > 0
-        )
-    ]
-
-    if candidates:
-
-        sigma = min(
-            candidates
-        )
-
-    else:
-
-        sigma = max(
-            abs(
-                float(
-                    np.mean(values)
-                )
-            ),
-            1.0,
-        )
-
-    bandwidth = (
-        0.9
-        * sigma
-        * len(values) ** (-1 / 5)
-    )
-
-    return max(
-        float(bandwidth),
-        1e-6,
-    )
-
-
-def kde_curve(
-    values: np.ndarray,
-    log_space: bool,
-    n_points: int = 600,
-):
-    """Calculate 1D KDE curve."""
-
-    values = np.asarray(
-        values,
-        dtype=float,
-    )
-
-    values = values[
-        np.isfinite(values)
-    ]
-
-    # --------------------------------------------------------
-    # LOG DWELL KDE
-    # --------------------------------------------------------
-
-    if log_space:
-
-        values = values[
-            values > 0
-        ]
-
-        transformed = np.log10(
-            values
-        )
-
-    else:
-
-        transformed = values
-
-    if len(transformed) < 2:
-
-        return (
-            None,
-            None,
-        )
-
-    lo = float(
-        np.min(transformed)
-    )
-
-    hi = float(
-        np.max(transformed)
-    )
-
-    if np.isclose(
-        lo,
-        hi,
-    ):
-
-        return (
-            None,
-            None,
-        )
-
-    padding = (
-        0.03
-        * (hi - lo)
-    )
-
-    grid = np.linspace(
-        lo - padding,
-        hi + padding,
-        n_points,
-    )
-
-    bandwidth = silverman_bandwidth(
-        transformed
-    )
-
-    kde = KernelDensity(
-        kernel="gaussian",
-        bandwidth=bandwidth,
-    )
-
-    kde.fit(
-        transformed.reshape(
-            -1,
-            1,
-        )
-    )
-
-    density = np.exp(
-        kde.score_samples(
-            grid.reshape(
-                -1,
-                1,
-            )
-        )
-    )
-
-    if log_space:
-
-        x = 10 ** grid
-
-    else:
-
-        x = grid
-
-    return (
-        x,
-        density,
-    )
-
-
-
-# ============================================================
-# HISTOGRAM / 2D DENSITY HELPERS
-# ============================================================
-
-
-def estimate_dwell_resolution_ms(dwell_ms: np.ndarray) -> float:
-    """
-    Estimate the discrete dwell-time spacing from the data.
-
-    Short nanopore events often occur at discrete sample intervals. Using a
-    histogram bin width close to this spacing avoids artificial empty gaps
-    caused by choosing far too many bins.
-    """
-
-    values = np.asarray(dwell_ms, dtype=float)
-    values = values[np.isfinite(values) & (values > 0)]
-
-    if len(values) < 2:
-        return 0.005
-
-    unique_values = np.unique(np.round(values, 6))
-
-    if len(unique_values) < 2:
-        return 0.005
-
-    diffs = np.diff(unique_values)
-    diffs = diffs[diffs > 1e-6]
-
-    if len(diffs) == 0:
-        return 0.005
-
-    # A low percentile is robust to occasional missing dwell values while
-    # still recovering the underlying sampling increment.
-    resolution = float(np.percentile(diffs, 10))
-
-    return float(np.clip(resolution, 0.001, 0.05))
-
-
-def linear_histogram_edges(values: np.ndarray, bin_width_ms: float) -> np.ndarray:
-    """Create linear bin edges aligned to the selected bin width."""
-
-    values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-
-    if len(values) == 0:
-        return np.array([0.0, bin_width_ms], dtype=float)
-
-    bin_width_ms = max(float(bin_width_ms), 1e-9)
-
-    low = float(np.min(values))
-    high = float(np.max(values))
-
-    # Centre quantized dwell values inside their bins. This prevents the
-    # alternating-bar appearance that can happen when bin edges sit directly
-    # on the discrete sample times.
-    start = np.floor(low / bin_width_ms) * bin_width_ms - 0.5 * bin_width_ms
-    stop = np.ceil(high / bin_width_ms) * bin_width_ms + 1.5 * bin_width_ms
-
-    edges = np.arange(start, stop, bin_width_ms)
-
-    if len(edges) < 2:
-        edges = np.array([low - 0.5 * bin_width_ms, high + 0.5 * bin_width_ms])
-
-    return edges
+st.markdown("""
+<style>
+:root { color-scheme: dark; }
+.block-container { max-width: 1480px; padding-top: 1.65rem; padding-bottom: 3rem; }
+[data-testid="stSidebar"] { border-right: 1px solid #263748; }
+h1, h2, h3 { letter-spacing: -.025em; }
+.stTabs [data-baseweb="tab-list"] { gap: .45rem; border-bottom: 1px solid #2A3B4C; }
+.stTabs [data-baseweb="tab"] { border-radius: 8px 8px 0 0; padding: .6rem 1rem; }
+.stButton button[kind="primary"], .stDownloadButton button[kind="primary"] {
+    background: #287F7B; border: 1px solid #3A9994; color: white;
+}
+.stButton button[kind="primary"]:hover, .stDownloadButton button[kind="primary"]:hover {
+    background: #32918B; color: white;
+}
+.np-eyebrow { color: #80BDB7; font-size: .72rem; font-weight: 700;
+    letter-spacing: .13em; text-transform: uppercase; margin-bottom: .4rem; }
+.np-subtitle { color: #AABBC9; font-size: 1rem; line-height: 1.65; max-width: 780px; }
+.np-rule { height: 1px; background: #27394A; margin: 1.2rem 0; }
+.np-note { background: #172B3A; border: 1px solid #2C4556;
+    border-radius: 10px; padding: .8rem 1rem; color: #C4D4DE; font-size: .89rem; }
+.np-kicker { color: #92A9BA; font-size: .78rem; letter-spacing: .035em; }
+</style>
+""", unsafe_allow_html=True)
 
 
 @st.cache_data(show_spinner=False)
-def true_2d_kde_density(
-    x: np.ndarray,
-    y: np.ndarray,
-    log_x: bool = False,
-    grid_size: int = 220,
-    bandwidth_scale: float = 1.0,
-    x_percentiles: tuple[float, float] = (0.2, 99.8),
-    y_percentiles: tuple[float, float] = (0.2, 99.8),
-):
-    """
-    Genuine smooth 2D Gaussian KDE for nanopore event-density plots.
+def load_cached(dataset_bytes, event_bytes, fitting_bytes, unit):
+    return read_sources(dataset_bytes, event_bytes, fitting_bytes, unit)
 
-    This version uses scipy.stats.gaussian_kde because it gives the classic
-    continuous KDE cloud appearance desired for ΔI-vs-dwell plots.
 
-    Parameters
-    ----------
-    x
-        Dwell time in ms.
-    y
-        Selected event metric (e.g. ΔI in pA).
-    log_x
-        If True, KDE is fitted in log10(dwell time). For figures like the
-        desired example, leave this False so dwell time remains linear.
-    grid_size
-        Number of evaluation points per axis.
-    bandwidth_scale
-        Multiplier applied to Scott's KDE bandwidth.
-        < 1 gives sharper structure; > 1 gives smoother structure.
-    x_percentiles, y_percentiles
-        Robust display limits used to prevent a few extreme outliers from
-        stretching the density field.
+@st.cache_data(show_spinner=False, max_entries=4)
+def fit_cached(dwell_ms, delta_i, max_k):
+    return select_2d_gmm_components_bic(
+        dwell_ms, delta_i, max_components=max_k
+    )
 
-    Returns
-    -------
-    x_grid, y_grid, density
-        1D display coordinates and 2D KDE density array.
-    """
 
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
+@st.cache_data(show_spinner=False, max_entries=8)
+def topology_cached(fitting_bytes, n_events, threshold):
+    from splitter_core import load_npz_bytes
+    fitting = load_npz_bytes(fitting_bytes)
+    return reclassify_segment_counts_by_similarity(
+        fitting, n_events, threshold
+    )
 
-    valid = np.isfinite(x) & np.isfinite(y)
 
-    if log_x:
-        valid &= x > 0
+@st.cache_data(show_spinner=False, max_entries=4)
+def metrics_cached(fitting_bytes, n_events):
+    from splitter_core import load_npz_bytes
+    return derive_event_metrics(load_npz_bytes(fitting_bytes), n_events)
 
-    x = x[valid]
-    y = y[valid]
 
+def fmt(value, digits=3):
+    return f"{value:,.{digits}f}" if np.isfinite(value) else "—"
+
+
+def style_figure(fig, ax):
+    fig.patch.set_facecolor("#101D2B")
+    ax.set_facecolor("#101D2B")
+    for spine in ax.spines.values():
+        spine.set_color("#3D5062")
+    ax.tick_params(colors="#B9C9D5", labelsize=9)
+    ax.xaxis.label.set_color("#CEDAE3")
+    ax.yaxis.label.set_color("#CEDAE3")
+    ax.title.set_color("#F0F5F8")
+    ax.grid(False)
+    return fig, ax
+
+
+def new_figure(figsize=(8.8, 5)):
+    fig, ax = plt.subplots(figsize=figsize, dpi=120)
+    return style_figure(fig, ax)
+
+
+def render_figure(fig, filename=None):
+    st.pyplot(fig, clear_figure=False, use_container_width=True)
+    if filename:
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=300, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        st.download_button("Download figure · PNG", buf.getvalue(),
+                           file_name=filename, mime="image/png")
+    plt.close(fig)
+
+
+def colour(index):
+    return COLORS[index % len(COLORS)]
+
+
+def raw_density(dwell, delta, log_x=False, smooth=1.0):
+    """Smooth KDE is visual-only; bounded sample and grid protect Cloud memory."""
+    valid = np.isfinite(dwell) & (dwell > 0) & np.isfinite(delta)
+    x, y = dwell[valid], delta[valid]
     if len(x) < 5:
-        return None, None, None
-
-    if log_x:
-        x_work = np.log10(x)
-    else:
-        x_work = x.copy()
-
-    # Robust display window.
-    x_low, x_high = np.percentile(
-        x_work,
-        x_percentiles,
-    )
-
-    y_low, y_high = np.percentile(
-        y,
-        y_percentiles,
-    )
-
-    keep = (
-        (x_work >= x_low)
-        & (x_work <= x_high)
-        & (y >= y_low)
-        & (y <= y_high)
-    )
-
-    x_work = x_work[keep]
-    y = y[keep]
-
-    if len(x_work) < 5:
-        return None, None, None
-
-    if x_low >= x_high or y_low >= y_high:
-        return None, None, None
-
-    # Fit a true 2D Gaussian KDE.
-    values = np.vstack(
-        [
-            x_work,
-            y,
-        ]
-    )
-
+        return None
+    if len(x) > 3500:
+        rng = np.random.default_rng(0)
+        chosen = rng.choice(len(x), 3500, replace=False)
+        x, y = x[chosen], y[chosen]
+    work = np.log10(x) if log_x else x
+    if np.ptp(work) <= 0 or np.ptp(y) <= 0:
+        return None
+    lo_x, hi_x = np.percentile(work, [0.2, 99.8])
+    lo_y, hi_y = np.percentile(y, [0.2, 99.8])
+    keep = (work >= lo_x) & (work <= hi_x) & (y >= lo_y) & (y <= hi_y)
+    work, y = work[keep], y[keep]
+    if len(work) < 5:
+        return None
     try:
-        kde = gaussian_kde(
-            values,
-            bw_method="scott",
-        )
+        kde = gaussian_kde(np.vstack([work, y]), bw_method="scott")
+        kde.set_bandwidth(kde.factor * smooth)
+        gx = np.linspace(lo_x, hi_x, 150)
+        gy = np.linspace(lo_y, hi_y, 150)
+        xx, yy = np.meshgrid(gx, gy)
+        zz = kde(np.vstack([xx.ravel(), yy.ravel()])).reshape(xx.shape)
+    except (ValueError, np.linalg.LinAlgError):
+        return None
+    return (10**gx if log_x else gx), gy, zz, len(work)
 
-        # Scale Scott's rule to give user-controlled smoothing.
-        kde.set_bandwidth(
-            bw_method=kde.factor * float(bandwidth_scale)
-        )
 
-    except Exception:
-        return None, None, None
-
-    # Evaluation grid.
-    x_grid_work = np.linspace(
-        x_low,
-        x_high,
-        int(grid_size),
-    )
-
-    y_grid = np.linspace(
-        y_low,
-        y_high,
-        int(grid_size),
-    )
-
-    GX, GY = np.meshgrid(
-        x_grid_work,
-        y_grid,
-    )
-
-    positions = np.vstack(
-        [
-            GX.ravel(),
-            GY.ravel(),
-        ]
-    )
-
-    density = kde(
-        positions
-    ).reshape(
-        GX.shape
-    )
-
-    # Convert x back to real dwell time for display.
+def plot_density(dwell, delta, log_x=False, smooth=1.0):
+    density = raw_density(dwell, delta, log_x, smooth)
+    if density is None:
+        st.info("A smooth KDE could not be calculated for these values.")
+        return
+    gx, gy, zz, n_plot = density
+    fig, ax = new_figure()
+    mesh = ax.pcolormesh(gx, gy, zz, shading="auto", cmap="magma")
     if log_x:
-        x_grid = 10 ** x_grid_work
-    else:
-        x_grid = x_grid_work
+        ax.set_xscale("log")
+    ax.set_xlabel("Dwell time (ms)")
+    ax.set_ylabel("ΔI (nA)")
+    ax.set_title("Event density")
+    cbar = fig.colorbar(mesh, ax=ax, pad=.025)
+    cbar.set_label("KDE density", color="#CEDAE3")
+    cbar.ax.tick_params(colors="#B9C9D5")
+    fig.tight_layout()
+    render_figure(fig, "event_density.png")
+    st.caption(f"KDE fitted to {n_plot:,} events. A reproducible sample is used "
+               "above 3,500 events. Smoothing and display limits do not alter clustering.")
 
-    return (
-        x_grid,
-        y_grid,
-        density,
+
+def plot_bic(table, best_k, selected_k):
+    fig, ax = new_figure((8.5, 4.1))
+    x = table["Components (K)"].to_numpy()
+    y = table["BIC"].to_numpy()
+    ax.plot(x, y, color="#75A9B8", lw=2, marker="o", ms=5)
+    ax.scatter([best_k], [float(np.min(y))], s=105, color="#3CB8AE",
+               zorder=5, label=f"Minimum BIC · K={best_k}")
+    if selected_k != best_k:
+        val = float(table.loc[table["Components (K)"] == selected_k, "BIC"].iloc[0])
+        ax.scatter([selected_k], [val], s=100, marker="D",
+                   color="#E9A55D", zorder=6, label=f"Selected · K={selected_k}")
+    ax.set_xticks(x)
+    ax.set_xlabel("Number of Gaussian components (K)")
+    ax.set_ylabel("BIC")
+    ax.set_title("Model selection")
+    ax.legend(frameon=False, labelcolor="#D3DEE7", fontsize=9)
+    fig.tight_layout()
+    render_figure(fig, "bic_model_selection.png")
+
+
+def plot_clusters(data, result, log_x=False, show_boundary=True):
+    idx = result["valid_idx"]
+    dwell = data["dwell_ms"]
+    delta = data["delta_i"]
+    labels = result["labels"]
+    fig, ax = new_figure((9.0, 5.7))
+    # Plot-only sampling, identical assignments and model are retained.
+    if len(idx) > 20000:
+        idx = np.sort(np.random.default_rng(0).choice(idx, 20000, replace=False))
+    if show_boundary and result["n_components"] > 1:
+        scaler, model = result["scaler"], result["model"]
+        log_d = np.log10(dwell[result["valid_idx"]])
+        amp = delta[result["valid_idx"]]
+        gx = np.linspace(np.percentile(log_d, .2), np.percentile(log_d, 99.8), 170)
+        gy = np.linspace(np.percentile(amp, .2), np.percentile(amp, 99.8), 145)
+        xx, yy = np.meshgrid(gx, gy)
+        features = np.column_stack([xx.ravel(), yy.ravel()])
+        pred = model.predict(scaler.transform(features))
+        ordered = result["raw_to_ordered"][pred].reshape(xx.shape)
+        ax.contour(10**xx, yy, ordered, levels=np.arange(result["n_components"]-1)+.5,
+                   colors="#8495A5", linewidths=.8, alpha=.55)
+    for k, indices in enumerate(result["cluster_indices"]):
+        selected = idx[labels[idx] == k]
+        ax.scatter(dwell[selected], delta[selected], s=8, alpha=.47,
+                   color=colour(k), edgecolors="none",
+                   label=f"C{k+1} · {len(indices):,}")
+    if log_x:
+        ax.set_xscale("log")
+    ax.set_xlabel("Dwell time (ms)")
+    ax.set_ylabel("ΔI (nA)")
+    ax.set_title("Selected-K population map")
+    ax.legend(frameon=False, labelcolor="#D3DEE7", fontsize=8,
+              loc="best", ncol=2, markerscale=2)
+    fig.tight_layout()
+    render_figure(fig, "gmm_population_map.png")
+
+
+def plot_histogram(data, result, metric, mode, bins, selected_clusters):
+    values = data["dwell_ms"] if metric == "Dwell time" else data["delta_i"]
+    arrays = [values[result["cluster_indices"][k]] for k in selected_clusters]
+    arrays = [a[np.isfinite(a)] for a in arrays]
+    nonempty = [a for a in arrays if len(a)]
+    if not nonempty:
+        st.info("No events are available for this histogram.")
+        return
+    all_values = values[result["valid_idx"]]
+    all_values = all_values[np.isfinite(all_values)]
+    low, high = np.min(all_values), np.max(all_values)
+    if low == high:
+        high = low + 1e-9
+    edges = np.linspace(low, high, bins + 1)
+    fig, ax = new_figure()
+    for k, arr in zip(selected_clusters, arrays):
+        if not len(arr):
+            continue
+        weights = None
+        density = mode == "Density · each cluster"
+        if mode == "Share of all events":
+            weights = np.full(len(arr), 1.0 / len(result["valid_idx"]))
+        ax.hist(arr, bins=edges, weights=weights, density=density,
+                histtype="step", linewidth=1.7, color=colour(k),
+                label=f"C{k+1} · {len(arr):,}")
+    ax.set_xlabel("Dwell time (ms)" if metric == "Dwell time" else "ΔI (nA)")
+    ax.set_ylabel({
+        "Count": "Number of events",
+        "Density · each cluster": "Probability density",
+        "Share of all events": "Fraction of all valid events / bin",
+    }[mode])
+    ax.set_title(f"{metric} distributions")
+    ax.legend(frameon=False, labelcolor="#D3DEE7", fontsize=9)
+    fig.tight_layout()
+    render_figure(fig, "cluster_distributions.png")
+
+
+def display_cluster_table(table):
+    st.dataframe(
+        table.style.format({
+            "% of valid events": "{:.1f}",
+            "Median dwell (ms)": "{:.4f}",
+            "Mean dwell (ms)": "{:.4f}",
+            "Mean ΔI (nA)": "{:.4f}",
+        }),
+        hide_index=True, use_container_width=True
     )
 
 
-
-# ============================================================
-# AXIS / HOVER HELPERS
-# ============================================================
-
-
-def axis_limit_controls(
-    key_prefix: str,
-    x_default: tuple[float, float],
-    y_default: tuple[float, float],
-    *,
-    log_x: bool = False,
-):
-    """
-    Optional manual plot limits.
-
-    These controls affect only what is displayed.
-    They do not alter the dwell-time cutoff, population assignment,
-    or exported event files.
-    """
-
-    x_range = None
-    y_range = None
-
-    with st.expander(
-        "Set axis limits / zoom",
-        expanded=False,
-    ):
-
-        st.caption(
-            "These limits change only the visible plot range. "
-            "They do not remove events or change the SHORT/LONG split."
-        )
-
-        set_x = st.checkbox(
-            "Set custom X-axis limits",
-            value=False,
-            key=f"{key_prefix}_custom_x",
-        )
-
-        if set_x:
-
-            x1, x2 = st.columns(2)
-
-            x_span = abs(
-                float(x_default[1])
-                - float(x_default[0])
-            )
-
-            x_step = max(
-                x_span / 200.0,
-                1e-6,
-            )
-
-            with x1:
-
-                x_min = st.number_input(
-                    "X minimum",
-                    value=float(x_default[0]),
-                    step=float(x_step),
-                    format="%.6f",
-                    key=f"{key_prefix}_xmin",
-                )
-
-            with x2:
-
-                x_max = st.number_input(
-                    "X maximum",
-                    value=float(x_default[1]),
-                    step=float(x_step),
-                    format="%.6f",
-                    key=f"{key_prefix}_xmax",
-                )
-
-            if log_x and x_min <= 0:
-
-                st.warning(
-                    "For a logarithmic X-axis, X minimum must be > 0."
-                )
-
-            elif x_min >= x_max:
-
-                st.warning(
-                    "X minimum must be smaller than X maximum."
-                )
-
-            else:
-
-                x_range = (
-                    float(x_min),
-                    float(x_max),
-                )
-
-        set_y = st.checkbox(
-            "Set custom Y-axis limits",
-            value=False,
-            key=f"{key_prefix}_custom_y",
-        )
-
-        if set_y:
-
-            y1, y2 = st.columns(2)
-
-            y_span = abs(
-                float(y_default[1])
-                - float(y_default[0])
-            )
-
-            y_step = max(
-                y_span / 200.0,
-                1e-6,
-            )
-
-            with y1:
-
-                y_min = st.number_input(
-                    "Y minimum",
-                    value=float(y_default[0]),
-                    step=float(y_step),
-                    format="%.6f",
-                    key=f"{key_prefix}_ymin",
-                )
-
-            with y2:
-
-                y_max = st.number_input(
-                    "Y maximum",
-                    value=float(y_default[1]),
-                    step=float(y_step),
-                    format="%.6f",
-                    key=f"{key_prefix}_ymax",
-                )
-
-            if y_min >= y_max:
-
-                st.warning(
-                    "Y minimum must be smaller than Y maximum."
-                )
-
-            else:
-
-                y_range = (
-                    float(y_min),
-                    float(y_max),
-                )
-
-    return x_range, y_range
-
-
-def apply_axis_limits(
-    ax,
-    x_range,
-    y_range,
-):
-    """Apply optional manual limits to a Matplotlib axis."""
-
-    if x_range is not None:
-        ax.set_xlim(
-            x_range[0],
-            x_range[1],
-        )
-
-    if y_range is not None:
-        ax.set_ylim(
-            y_range[0],
-            y_range[1],
-        )
-
-
-# ============================================================
-# 2D GMM HELPERS
-# ============================================================
-
-
-def select_2d_gmm_components_bic(
-    dwell_ms: np.ndarray,
-    delta_i: np.ndarray,
-    max_components: int = 5,
-):
-    """
-    Compare 1..max_components full-covariance 2D GMMs using BIC.
-
-    Every candidate model uses exactly the same preprocessing as the main
-    2D GMM: [log10(dwell time), delta-I] followed by StandardScaler.
-
-    Lower BIC is better. The returned best_k is the number of Gaussian
-    components with the minimum BIC. This is a statistical model-selection
-    diagnostic; it does not by itself prove that the same number of physical
-    nanopore mechanisms exists.
-    """
-
-    dwell_ms = np.asarray(dwell_ms, dtype=float)
-    delta_i = np.asarray(delta_i, dtype=float)
-
-    valid = (
-        np.isfinite(dwell_ms)
-        & (dwell_ms > 0)
-        & np.isfinite(delta_i)
-    )
-
-    valid_idx = np.flatnonzero(valid)
-
-    if len(valid_idx) < 20:
-        raise ValueError(
-            "At least 20 events with finite dwell time and ΔI are required "
-            "for BIC model selection."
-        )
-
-    features = np.column_stack(
-        [
-            np.log10(dwell_ms[valid_idx]),
-            delta_i[valid_idx],
-        ]
-    )
-
-    scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features)
-
-    max_components = int(max(1, max_components))
-    max_components = min(
-        max_components,
-        max(1, len(valid_idx) // 5),
-    )
-
-    rows = []
-    models = {}
-
-    for k in range(1, max_components + 1):
-
-        model = GaussianMixture(
-            n_components=k,
-            covariance_type="full",
-            random_state=0,
-            n_init=10,
-            reg_covar=1e-6,
-        )
-
-        model.fit(features_scaled)
-
-        bic_value = float(
-            model.bic(features_scaled)
-        )
-
-        rows.append(
-            {
-                "Components (K)": k,
-                "BIC": bic_value,
-            }
-        )
-
-        models[k] = model
-
-    table = pd.DataFrame(rows)
-
-    best_row = int(
-        table["BIC"].idxmin()
-    )
-
-    best_k = int(
-        table.loc[
-            best_row,
-            "Components (K)",
-        ]
-    )
-
-    min_bic = float(
-        table.loc[
-            best_row,
-            "BIC",
-        ]
-    )
-
-    table["ΔBIC from best"] = (
-        table["BIC"]
-        - min_bic
-    )
-
-    return {
-        "table": table,
-        "best_k": best_k,
-        "best_model": models[best_k],
-        "models": models,
-        "scaler": scaler,
-        "valid": valid,
-        "valid_idx": valid_idx,
-    }
-
-
-def build_bic_selected_population_result(
-    bic_result: dict,
-    dwell_ms: np.ndarray,
-    delta_i: np.ndarray,
-    selected_k: int | None = None,
-):
-    """Turn a BIC-tested GMM into ordered event populations.
-
-    By default this uses the minimum-BIC model. If selected_k is supplied, the
-    corresponding already-fitted candidate model is used instead. Components are
-    ordered by the median ORIGINAL dwell time of their assigned events so that
-    Cluster 1 is the shortest-dwell statistical population and Cluster K is the
-    longest-dwell statistical population. The labels remain generic clusters;
-    they are not assumed to represent specific physical nanopore mechanisms.
-    """
-
-    dwell_ms = np.asarray(dwell_ms, dtype=float)
-    delta_i = np.asarray(delta_i, dtype=float)
-
-    if selected_k is None:
-        selected_k = int(bic_result["best_k"])
-    else:
-        selected_k = int(selected_k)
-
-    models = bic_result.get("models", {})
-    if selected_k not in models:
-        raise ValueError(
-            f"K = {selected_k} was not included in the BIC candidate models."
-        )
-
-    model = models[selected_k]
-    scaler = bic_result["scaler"]
-    valid = np.asarray(bic_result["valid"], dtype=bool)
-    valid_idx = np.asarray(bic_result["valid_idx"], dtype=int)
-
-    features = np.column_stack(
-        [
-            np.log10(dwell_ms[valid_idx]),
-            delta_i[valid_idx],
-        ]
-    )
-
-    features_scaled = scaler.transform(features)
-    raw_labels = model.predict(features_scaled)
-    raw_probabilities = model.predict_proba(features_scaled)
-
-    n_components = int(model.n_components)
-
-    component_median_dwell = np.full(
-        n_components,
-        np.inf,
-        dtype=float,
-    )
-
-    for component in range(n_components):
-        component_values = dwell_ms[
-            valid_idx[raw_labels == component]
-        ]
-        if len(component_values):
-            component_median_dwell[component] = float(
-                np.median(component_values)
-            )
-
-    component_order = np.argsort(component_median_dwell)
-
-    raw_to_ordered = np.empty(n_components, dtype=int)
-    raw_to_ordered[component_order] = np.arange(n_components)
-
-    ordered_valid_labels = raw_to_ordered[raw_labels]
-
-    labels = np.full(
-        len(dwell_ms),
-        -1,
-        dtype=int,
-    )
-    labels[valid_idx] = ordered_valid_labels
-
-    probabilities = np.full(
-        (len(dwell_ms), n_components),
-        np.nan,
-        dtype=float,
-    )
-    probabilities[valid_idx, :] = raw_probabilities[
-        :,
-        component_order,
-    ]
-
-    centres_original = scaler.inverse_transform(
-        model.means_
-    )[component_order]
-
-    centre_dwell_ms = 10 ** centres_original[:, 0]
-    centre_delta_i = centres_original[:, 1]
-
-    median_dwell_ms = component_median_dwell[component_order]
-
-    cluster_indices = [
-        np.flatnonzero(labels == cluster)
-        for cluster in range(n_components)
-    ]
-
-    counts = np.asarray(
-        [len(idx) for idx in cluster_indices],
-        dtype=int,
-    )
-
-    # Descriptive statistics calculated directly from the ORIGINAL events
-    # assigned to each selected-K cluster. These are different from the GMM
-    # component centres, which are model parameters in log-dwell + ΔI space.
-    mean_dwell_ms = np.asarray(
-        [
-            float(np.mean(dwell_ms[idx])) if len(idx) else np.nan
-            for idx in cluster_indices
-        ],
-        dtype=float,
-    )
-
-    mean_delta_i = np.asarray(
-        [
-            float(np.mean(delta_i[idx])) if len(idx) else np.nan
-            for idx in cluster_indices
-        ],
-        dtype=float,
-    )
-
-    assignment_probability = np.max(
-        probabilities[valid_idx, :],
-        axis=1,
-    )
-
-    return {
-        "model": model,
-        "scaler": scaler,
-        "valid": valid,
-        "valid_idx": valid_idx,
-        "n_components": n_components,
-        "component_order": component_order,
-        "raw_to_ordered": raw_to_ordered,
-        "labels": labels,
-        "probabilities": probabilities,
-        "cluster_indices": cluster_indices,
-        "counts": counts,
-        "median_dwell_ms": median_dwell_ms,
-        "mean_dwell_ms": mean_dwell_ms,
-        "mean_delta_i": mean_delta_i,
-        "centre_dwell_ms": centre_dwell_ms,
-        "centre_delta_i": centre_delta_i,
-        "assignment_probability": assignment_probability,
-    }
-
-
-def fit_2d_gmm(
-    dwell_ms: np.ndarray,
-    delta_i: np.ndarray,
-):
-    """
-    Fit a two-component Gaussian mixture to
-    [log10(dwell time), delta-I].
-
-    Both features are standardized before fitting to place the numerical
-    coordinates on a well-conditioned, comparable standardized scale.
-
-    The two fitted components are labelled Short-like and Long-like by
-    their median dwell time. This is a 2D population assignment: there is
-    no single vertical dwell-time cutoff.
-    """
-
-    dwell_ms = np.asarray(dwell_ms, dtype=float)
-    delta_i = np.asarray(delta_i, dtype=float)
-
-    valid = (
-        np.isfinite(dwell_ms)
-        & (dwell_ms > 0)
-        & np.isfinite(delta_i)
-    )
-
-    valid_idx = np.flatnonzero(valid)
-
-    if len(valid_idx) < 20:
-        raise ValueError(
-            "At least 20 events with finite dwell time and ΔI are required "
-            "for the 2D GMM."
-        )
-
-    features = np.column_stack(
-        [
-            np.log10(dwell_ms[valid_idx]),
-            delta_i[valid_idx],
-        ]
-    )
-
-    scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features)
-
-    model = GaussianMixture(
-        n_components=2,
-        covariance_type="full",
-        random_state=0,
-        n_init=20,
-        reg_covar=1e-6,
-    )
-
-    raw_labels = model.fit_predict(features_scaled)
-    raw_probabilities = model.predict_proba(features_scaled)
-
-    component_median_dwell = []
-
-    for component in range(2):
-        component_values = dwell_ms[
-            valid_idx[raw_labels == component]
-        ]
-
-        if len(component_values) == 0:
-            component_median_dwell.append(np.inf)
-        else:
-            component_median_dwell.append(
-                float(np.median(component_values))
-            )
-
-    short_component = int(
-        np.argmin(component_median_dwell)
-    )
-    long_component = int(
-        np.argmax(component_median_dwell)
-    )
-
-    labels = np.full(
-        len(dwell_ms),
-        -1,
-        dtype=int,
-    )
-
-    labels[
-        valid_idx[raw_labels == short_component]
-    ] = 0
-
-    labels[
-        valid_idx[raw_labels == long_component]
-    ] = 1
-
-    p_short = np.full(
-        len(dwell_ms),
-        np.nan,
-        dtype=float,
-    )
-
-    p_long = np.full(
-        len(dwell_ms),
-        np.nan,
-        dtype=float,
-    )
-
-    p_short[valid_idx] = raw_probabilities[
-        :,
-        short_component,
-    ]
-
-    p_long[valid_idx] = raw_probabilities[
-        :,
-        long_component,
-    ]
-
-    # Convert the GMM centres back into the original feature units.
-    centres_original = scaler.inverse_transform(
-        model.means_
-    )
-
-    short_centre = centres_original[
-        short_component
-    ]
-
-    long_centre = centres_original[
-        long_component
-    ]
-
-    result = {
-        "model": model,
-        "scaler": scaler,
-        "short_component": short_component,
-        "long_component": long_component,
-        "labels": labels,
-        "p_short": p_short,
-        "p_long": p_long,
-        "valid": valid,
-        "valid_idx": valid_idx,
-        "short_idx": np.flatnonzero(labels == 0),
-        "long_idx": np.flatnonzero(labels == 1),
-        "short_centre_dwell_ms": float(
-            10 ** short_centre[0]
-        ),
-        "long_centre_dwell_ms": float(
-            10 ** long_centre[0]
-        ),
-        "short_centre_delta_i": float(
-            short_centre[1]
-        ),
-        "long_centre_delta_i": float(
-            long_centre[1]
-        ),
-    }
-
-    return result
-
-
-def make_2d_gmm_zip(
-    stem: str,
-    delta_i_name: str,
-    short_files: dict,
-    long_files: dict,
-    short_map: pd.DataFrame,
-    long_map: pd.DataFrame,
-    p_short: np.ndarray,
-    p_long: np.ndarray,
-    excluded_idx: np.ndarray | None = None,
-    dwell_ms: np.ndarray | None = None,
-    delta_i: np.ndarray | None = None,
-) -> bytes:
-    """
-    Package synchronized 2D-GMM populations into one ZIP archive.
-
-    Events without valid 2D features are never silently discarded. If the
-    user explicitly chooses to continue, they are written to
-    excluded_events.csv with their original row indices and the reason they
-    could not be classified.
-    """
-
-    short_map = short_map.copy()
-    long_map = long_map.copy()
-
-    if len(short_map):
-        source_rows = short_map[
-            "original_row_index"
-        ].to_numpy(dtype=int)
-
-        short_map[
-            "gmm_p_short_like"
-        ] = p_short[source_rows]
-
-        short_map[
-            "gmm_p_long_like"
-        ] = p_long[source_rows]
-
-    if len(long_map):
-        source_rows = long_map[
-            "original_row_index"
-        ].to_numpy(dtype=int)
-
-        long_map[
-            "gmm_p_short_like"
-        ] = p_short[source_rows]
-
-        long_map[
-            "gmm_p_long_like"
-        ] = p_long[source_rows]
-
-    if excluded_idx is None:
-        excluded_idx = np.array([], dtype=int)
-    else:
-        excluded_idx = np.asarray(
-            excluded_idx,
-            dtype=int,
-        )
-
-    excluded_table = pd.DataFrame()
-
-    if len(excluded_idx):
-
-        if dwell_ms is None or delta_i is None:
-            raise ValueError(
-                "dwell_ms and delta_i are required when excluded events are recorded."
-            )
-
-        dwell_ms = np.asarray(
-            dwell_ms,
-            dtype=float,
-        )
-
-        delta_i = np.asarray(
-            delta_i,
-            dtype=float,
-        )
-
-        exclusion_reasons = []
-
-        for idx in excluded_idx:
-
-            reasons = []
-
-            if not np.isfinite(dwell_ms[idx]):
-                reasons.append(
-                    "non-finite dwell time"
-                )
-
-            elif dwell_ms[idx] <= 0:
-                reasons.append(
-                    "non-positive dwell time"
-                )
-
-            if not np.isfinite(delta_i[idx]):
-                reasons.append(
-                    "non-finite ΔI"
-                )
-
-            exclusion_reasons.append(
-                "; ".join(reasons)
-                if reasons
-                else "invalid 2D feature"
-            )
-
-        excluded_table = pd.DataFrame(
-            {
-                "original_row_index": excluded_idx,
-                "dwell_time_ms": dwell_ms[excluded_idx],
-                "delta_i": delta_i[excluded_idx],
-                "exclusion_reason": exclusion_reasons,
-            }
-        )
-
-    buffer = io.BytesIO()
-
-    with zipfile.ZipFile(
-        buffer,
-        mode="w",
-        compression=zipfile.ZIP_DEFLATED,
-    ) as zf:
-
-        for population, files in (
-            ("SHORT_2D", short_files),
-            ("LONG_2D", long_files),
-        ):
-
-            zf.writestr(
-                f"{population}/{stem}_{population}.event_data.npz",
-                files["event_data"],
-            )
-
-            zf.writestr(
-                f"{population}/{stem}_{population}.dataset.npz",
-                files["dataset"],
-            )
-
-            zf.writestr(
-                f"{population}/{stem}_{population}.event_fitting.npz",
-                files["event_fitting"],
-            )
-
-        mapping = pd.concat(
-            [
-                short_map,
-                long_map,
-            ],
-            ignore_index=True,
-        )
-
-        zf.writestr(
-            "event_id_mapping.csv",
-            mapping.to_csv(index=False).encode("utf-8"),
-        )
-
-        if len(excluded_table):
-
-            zf.writestr(
-                "excluded_events.csv",
-                excluded_table.to_csv(index=False).encode("utf-8"),
-            )
-
-        excluded_note = (
-            f"Excluded/unclassified events: {len(excluded_idx)}\n"
-        )
-
-        if len(excluded_idx):
-
-            excluded_note += (
-                "These events were not assigned to either 2D population because "
-                "one or more required 2D features were invalid. "
-                "They are listed in excluded_events.csv.\n"
-            )
-
-        zf.writestr(
-            "split_info.txt",
-            (
-                "Nanopore 2D GMM population split\n"
-                "Features: log10(dwell time) + ΔI\n"
-                f"ΔI source: {delta_i_name}\n"
-                "Both features were standardized before fitting.\n"
-                "Two-component full-covariance Gaussian mixture model.\n"
-                "Components were named Short-like and Long-like according "
-                "to their median dwell time.\n"
-                "There is no single dwell-time cutoff for this 2D split.\n"
-                f"Short-like events: {len(short_map)}\n"
-                f"Long-like events: {len(long_map)}\n"
-                f"{excluded_note}\n"
-                "Each exported population contains synchronized event_data, "
-                "dataset, and event_fitting NPZ files.\n"
-                "Event IDs are re-numbered 0..N-1 within each population.\n"
-                "event_id_mapping.csv preserves original event IDs, row "
-                "indices, and GMM posterior assignment probabilities.\n"
-            ).encode("utf-8"),
-        )
-
-    return buffer.getvalue()
-
-
-def make_bic_selected_gmm_zip(
-    stem: str,
-    delta_i_name: str,
-    cluster_files: list[dict],
-    cluster_maps: list[pd.DataFrame],
-    probabilities: np.ndarray,
-    median_dwell_ms: np.ndarray,
-    bic_table: pd.DataFrame,
-    preferred_k: int | None = None,
-    selected_k: int | None = None,
-    excluded_idx: np.ndarray | None = None,
-    dwell_ms: np.ndarray | None = None,
-    delta_i: np.ndarray | None = None,
-) -> bytes:
-    """Package a BIC-guided, user-selected-K GMM split into one ZIP archive."""
-
-    n_components = len(cluster_files)
-    if selected_k is None:
-        selected_k = n_components
-    selected_k = int(selected_k)
-    if preferred_k is None:
-        preferred_k = selected_k
-    preferred_k = int(preferred_k)
-    probabilities = np.asarray(probabilities, dtype=float)
-    median_dwell_ms = np.asarray(median_dwell_ms, dtype=float)
-
-    maps_with_probabilities = []
-
-    for cluster_number, population_map in enumerate(cluster_maps, start=1):
-        population_map = population_map.copy()
-
-        if len(population_map):
-            source_rows = population_map[
-                "original_row_index"
-            ].to_numpy(dtype=int)
-
-            for probability_cluster in range(n_components):
-                population_map[
-                    f"gmm_p_cluster_{probability_cluster + 1}"
-                ] = probabilities[
-                    source_rows,
-                    probability_cluster,
-                ]
-
-        population_map[
-            "gmm_ordered_cluster"
-        ] = cluster_number
-
-        maps_with_probabilities.append(population_map)
-
-    if excluded_idx is None:
-        excluded_idx = np.array([], dtype=int)
-    else:
-        excluded_idx = np.asarray(excluded_idx, dtype=int)
-
-    excluded_table = pd.DataFrame()
-
-    if len(excluded_idx):
-        if dwell_ms is None or delta_i is None:
-            raise ValueError(
-                "dwell_ms and delta_i are required when excluded events are recorded."
-            )
-
-        dwell_ms = np.asarray(dwell_ms, dtype=float)
-        delta_i = np.asarray(delta_i, dtype=float)
-
-        exclusion_reasons = []
-
-        for idx in excluded_idx:
-            reasons = []
-
-            if not np.isfinite(dwell_ms[idx]):
-                reasons.append("non-finite dwell time")
-            elif dwell_ms[idx] <= 0:
-                reasons.append("non-positive dwell time")
-
-            if not np.isfinite(delta_i[idx]):
-                reasons.append("non-finite ΔI")
-
-            exclusion_reasons.append(
-                "; ".join(reasons)
-                if reasons
-                else "invalid 2D feature"
-            )
-
-        excluded_table = pd.DataFrame(
-            {
-                "original_row_index": excluded_idx,
-                "dwell_time_ms": dwell_ms[excluded_idx],
-                "delta_i": delta_i[excluded_idx],
-                "exclusion_reason": exclusion_reasons,
-            }
-        )
-
-    buffer = io.BytesIO()
-
-    with zipfile.ZipFile(
-        buffer,
-        mode="w",
-        compression=zipfile.ZIP_DEFLATED,
-    ) as zf:
-
-        for cluster_number, files in enumerate(cluster_files, start=1):
-            population = f"GMM_CLUSTER_{cluster_number}"
-
-            zf.writestr(
-                f"{population}/{stem}_{population}.event_data.npz",
-                files["event_data"],
-            )
-            zf.writestr(
-                f"{population}/{stem}_{population}.dataset.npz",
-                files["dataset"],
-            )
-            zf.writestr(
-                f"{population}/{stem}_{population}.event_fitting.npz",
-                files["event_fitting"],
-            )
-
-        if maps_with_probabilities:
-            mapping = pd.concat(
-                maps_with_probabilities,
-                ignore_index=True,
-            )
-            zf.writestr(
-                "event_id_mapping.csv",
-                mapping.to_csv(index=False).encode("utf-8"),
-            )
-
-        zf.writestr(
-            "bic_model_selection.csv",
-            bic_table.to_csv(index=False).encode("utf-8"),
-        )
-
-        if len(excluded_table):
-            zf.writestr(
-                "excluded_events.csv",
-                excluded_table.to_csv(index=False).encode("utf-8"),
-            )
-
-        cluster_lines = []
-        for cluster_number in range(n_components):
-            cluster_lines.append(
-                f"Cluster {cluster_number + 1}: "
-                f"{len(cluster_maps[cluster_number])} events; "
-                f"median dwell = {median_dwell_ms[cluster_number]:.6g} ms"
-            )
-
-        excluded_note = (
-            f"Excluded/unclassified events: {len(excluded_idx)}\n"
-        )
-
-        if len(excluded_idx):
-            excluded_note += (
-                "These events were not assigned because one or more required "
-                "2D features were invalid. They are listed in excluded_events.csv.\n"
-            )
-
-        zf.writestr(
-            "split_info.txt",
-            (
-                "Nanopore BIC-guided 2D GMM population split\n"
-                "Features: log10(dwell time) + ΔI\n"
-                f"ΔI source: {delta_i_name}\n"
-                "Both features were standardized before fitting.\n"
-                "Candidate models used full-covariance Gaussian mixtures.\n"
-                f"BIC-preferred number of components: {preferred_k}\n"
-                f"Exported/user-selected number of components: {selected_k}\n"
-                "Clusters are ordered by median ORIGINAL dwell time; Cluster 1 "
-                "has the shortest median dwell. These are statistical cluster "
-                "labels, not assumed physical mechanisms.\n"
-                + "\n".join(cluster_lines)
-                + "\n"
-                + excluded_note
-                + "\nEach exported cluster contains synchronized event_data, dataset, "
-                "and event_fitting NPZ files.\n"
-                "Event IDs are re-numbered 0..N-1 inside each cluster.\n"
-                "event_id_mapping.csv preserves original row indices and all "
-                "selected-K GMM posterior probabilities.\n"
-                "bic_model_selection.csv contains the BIC comparison across K.\n"
-            ).encode("utf-8"),
-        )
-
-    return buffer.getvalue()
-
-
-# ============================================================
-# MAIN APP
-# ============================================================
-
-
-def main() -> None:
-
-    st.set_page_config(
-
-        page_title=
-        "Nanopore Event Population Splitter",
-
-        page_icon="🧬",
-
-        layout="wide",
-    )
-
-    st.title(
-        "🧬 Nanopore Event Population Splitter"
-    )
-
-    st.caption(
-        "Split short- and long-dwell event populations "
-        "while keeping event_data, dataset, and event_fitting "
-        "files synchronized. Includes dwell-time, 2D KDE, and "
-        "optional dwell + ΔI GMM population analysis."
-    )
-
-    # ========================================================
-    # 1. LOAD FILES
-    # ========================================================
-
-    with st.sidebar:
-
-        st.header(
-            "1 · Load matching files"
-        )
-
-        f_event_data = st.file_uploader(
-
-            "event_data (.npz)",
-
-            type=["npz"],
-
-            key="event_data",
-        )
-
-        f_dataset = st.file_uploader(
-
-            "dataset (.npz)",
-
-            type=["npz"],
-
-            key="dataset",
-        )
-
-        f_fitting = st.file_uploader(
-
-            "event_fitting (.npz)",
-
-            type=["npz"],
-
-            key="event_fitting",
-        )
-
-        st.divider()
-
-        st.caption(
-            f"Version {APP_VERSION}"
-        )
-
-    if not all(
-        [
-            f_event_data,
-            f_dataset,
-            f_fitting,
-        ]
-    ):
-
-        st.info(
-            "Upload the three matching NPZ files "
-            "from one dataset to begin."
-        )
-
-        st.stop()
-
-    # ========================================================
-    # LOAD AND VALIDATE
-    # ========================================================
-
-    with st.spinner(
-        "Loading and checking event synchronization..."
-    ):
-
-        (
-            event_data,
-            dataset,
-            event_fitting,
-            derived_metrics,
-        ) = load_three_files(
-
-            f_event_data.getvalue(),
-
-            f_dataset.getvalue(),
-
-            f_fitting.getvalue(),
-        )
-
-        try:
-
-            dwell_s, _, notes = validate_inputs(
-
-                event_data,
-                dataset,
-                event_fitting,
-            )
-
-        except Exception as exc:
-
-            st.error(
-                f"Validation failed: {exc}"
-            )
-
-            st.stop()
-
-    dwell_ms = (
-        np.asarray(
-            dwell_s,
-            dtype=float,
-        )
-        * 1000.0
-    )
-
-    n_events = len(
-        dwell_ms
-    )
-
-    X = np.asarray(
-        dataset["X"],
-        dtype=float,
-    )
-
-    dwell_resolution_ms = estimate_dwell_resolution_ms(
-        dwell_ms
-    )
-
-    st.success(
-        f"Files are synchronized correctly: "
-        f"**{n_events:,} events**."
-    )
-
-    st.caption(
-        "Checks: "
-        + "; ".join(notes)
-        + "."
-    )
-
-    # ========================================================
-    # AUTOMATIC GMM SPLIT
-    # ========================================================
-
-    try:
-
-        suggested_cutoff, gmm = (
-            auto_cutoff_gmm(
-                dwell_ms
-            )
-        )
-
-    except Exception as exc:
-
-        suggested_cutoff = float(
-            np.median(
-                dwell_ms
-            )
-        )
-
-        gmm = None
-
-        st.warning(
-
-            "Automatic two-population suggestion "
-            "was unavailable "
-
-            f"({exc}). "
-
-            "The median is being used only "
-            "as an initial value."
-        )
-
-    # ========================================================
-    # COLUMNS
-    # ========================================================
-
-    plot_col, control_col = st.columns(
-        [2, 1],
-        gap="large",
-    )
-
-    # ========================================================
-    # 2. CUT-OFF CONTROL
-    # ========================================================
-
-    with control_col:
-
-        st.subheader(
-            "2 · Choose the dwell-time boundary"
-        )
-
-        st.write(
-            "**SHORT:** dwell ≤ cutoff  \n"
-            "**LONG:** dwell > cutoff"
-        )
-
-        st.caption(
-
-            "The GMM value is an automatic starting point only. "
-
-            "Inspect the distribution and choose the valley "
-            "that best separates the populations "
-            "in that dataset."
-        )
-
-        cutoff_ms = st.number_input(
-
-            "Cutoff (ms)",
-
-            min_value=
-            float(
-                dwell_ms.min()
-            ),
-
-            max_value=
-            float(
-                dwell_ms.max()
-            ),
-
-            value=
-            float(
-                suggested_cutoff
-            ),
-
-            step=0.005,
-
-            format="%.5f",
-        )
-
-        # ----------------------------------------------------
-        # GMM INFO
-        # ----------------------------------------------------
-
-        if gmm is not None:
-
-            st.caption(
-
-                f"GMM suggestion: "
-                f"**{suggested_cutoff:.4f} ms**  \n"
-
-                f"Approx. centres: "
-                f"{gmm['short_geometric_mean_ms']:.4f} ms "
-                f"and "
-                f"{gmm['long_geometric_mean_ms']:.4f} ms"
-            )
-
-        # ----------------------------------------------------
-        # SPLIT EVENT INDICES
-        # ----------------------------------------------------
-
-        short_idx = np.flatnonzero(
-            dwell_ms <= cutoff_ms
-        )
-
-        long_idx = np.flatnonzero(
-            dwell_ms > cutoff_ms
-        )
-
-        metric_a, metric_b = st.columns(
-            2
-        )
-
-        metric_a.metric(
-
-            "Short events",
-
-            f"{len(short_idx):,}",
-
-            f"{100 * len(short_idx) / n_events:.1f}%",
-        )
-
-        metric_b.metric(
-
-            "Long events",
-
-            f"{len(long_idx):,}",
-
-            f"{100 * len(long_idx) / n_events:.1f}%",
-        )
-
-        if (
-            len(short_idx)
-            and len(long_idx)
-        ):
-
-            st.write(
-
-                f"Short median: "
-                f"**{np.median(dwell_ms[short_idx]):.4f} ms**  \n"
-
-                f"Long median: "
-                f"**{np.median(dwell_ms[long_idx]):.4f} ms**"
-            )
-
-        else:
-
-            st.warning(
-                "Move the cutoff so that both populations "
-                "contain events."
-            )
-
-        st.caption(
-            f"Estimated dwell-time resolution: "
-            f"**{dwell_resolution_ms:.4f} ms**"
-        )
-
-    # ========================================================
-    # 2B. OPTIONAL 2D GMM SPLIT
-    # ========================================================
-
+def display_topology_table(table):
+    st.dataframe(table.style.format({
+        "Mean original segments": "{:.3f}",
+        "Mean reclassified segments": "{:.3f}",
+        "% linear": "{:.1f}", "% folded": "{:.1f}", "% complex": "{:.1f}",
+    }), hide_index=True, use_container_width=True)
+
+
+def plot_topology(table):
+    fig, ax = new_figure((9, 4.8))
+    x = np.arange(len(table))
+    width = .25
+    labels = ["Linear-like", "Folded-like", "Complex"]
+    columns = ["% linear", "% folded", "% complex"]
+    colours = ["#3CB8AE", "#E9A55D", "#8B8BEA"]
+    for i, (name, column, c) in enumerate(zip(labels, columns, colours)):
+        vals = table[column].fillna(0).to_numpy()
+        ax.bar(x + (i-1)*width, vals, width=.24, color=c, label=name)
+    ax.set_xticks(x)
+    ax.set_xticklabels(table["Cluster"])
+    ax.set_ylabel("Events with usable topology (%)")
+    ax.set_ylim(0, 105)
+    ax.set_title("Segment-derived event classes")
+    ax.legend(frameon=False, labelcolor="#D3DEE7", ncol=3, fontsize=9)
+    fig.tight_layout()
+    render_figure(fig, "topology_by_cluster.png")
+
+
+def safe_stem(filename):
+    stem = clean_stem(filename)
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._") or "nanopore"
+
+
+# ─────────────────────────────────────────────────────────────
+# APPLICATION
+# ─────────────────────────────────────────────────────────────
+
+st.markdown('<div class="np-eyebrow">Research analysis workspace</div>',
+            unsafe_allow_html=True)
+st.title("Nanopore Studio")
+st.markdown(
+    '<div class="np-subtitle">Explore event distributions, select Gaussian '
+    'mixture models with BIC, and characterise DNA transport populations '
+    'without changing the original measurements.</div>',
+    unsafe_allow_html=True
+)
+
+with st.sidebar:
+    st.markdown("### Data sources")
+    st.caption("Only the dataset is required for clustering.")
+    f_dataset = st.file_uploader("Dataset · required", type=["npz"], key="np_dataset")
+    with st.expander("Optional companion files", expanded=False):
+        f_event = st.file_uploader("Event data · optional", type=["npz"], key="np_event")
+        f_fitting = st.file_uploader("Event fitting · optional", type=["npz"], key="np_fitting")
+        st.caption("Event data enables original-ID mapping and synchronized exports. "
+                   "Event fitting enables segment and topology analysis.")
+    unit = st.selectbox("Stored dwell-time unit", ["s", "ms", "us"], index=0,
+                        format_func=lambda u: {"s":"Seconds (NanoSense default)",
+                                               "ms":"Milliseconds", "us":"Microseconds"}[u])
     st.divider()
+    st.caption(f"Nanopore Studio · v{VERSION}")
+    st.caption("Files are processed by the Streamlit server hosting this app. Source files are not modified.")
 
-    st.subheader(
-        "2B · Compare with a 2D GMM: dwell time + ΔI"
-    )
+if f_dataset is None:
+    st.markdown('<div class="np-rule"></div>', unsafe_allow_html=True)
+    st.info("Upload a NanoSense dataset.npz to begin. The other two files are optional.")
+    st.markdown("**The streamlined workflow**")
+    st.write("Inspect your data → compare candidate K with BIC → select and "
+             "characterise clusters → optionally reclassify segment topology → export.")
+    st.stop()
 
-    st.caption(
-        "This section analyses populations in log10(dwell time) + ΔI space. "
-        "The standard two-component Short-like/Long-like split is retained for "
-        "direct comparison, while the optional BIC analysis can choose the "
-        "number of Gaussian components and, if requested, show/export that "
-        "BIC-guided multi-population split with user-selectable K. The original dwell-only split "
-        "above is left unchanged."
-    )
+dataset_bytes = f_dataset.getvalue()
+event_bytes = f_event.getvalue() if f_event else None
+fitting_bytes = f_fitting.getvalue() if f_fitting else None
+source_id = hashlib.sha256(
+    dataset_bytes + unit.encode() + (event_bytes or b"") + (fitting_bytes or b"")
+).hexdigest()
 
-    gmm2d_control_col, gmm2d_result_col = st.columns(
-        [1.05, 1.45],
-        gap="large",
-    )
+try:
+    with st.spinner("Reading and validating the dataset…"):
+        data = load_cached(dataset_bytes, event_bytes, fitting_bytes, unit)
+except Exception as exc:
+    st.error(f"Unable to load these sources: {exc}")
+    st.stop()
 
-    with gmm2d_control_col:
+n_total = len(data["dwell_ms"])
+n_valid = int(data["valid"].sum())
+n_excluded = n_total - n_valid
 
-        gmm2d_source = st.selectbox(
-            "ΔI used for the 2D GMM",
-            [
-                "ΔI from dataset.npz",
-                "Peak segment ΔI from event_fitting",
-                "Time-weighted segment ΔI from event_fitting",
-            ],
-            index=0,
-            help=(
-                "Choose the event-level blockade feature used together with "
-                "log10(dwell time). The GMM standardizes both features before fitting."
-            ),
-        )
+if st.session_state.get("np_source_id") != source_id:
+    st.session_state["np_source_id"] = source_id
+    st.session_state.pop("np_fit", None)
+    st.session_state.pop("np_export", None)
+    st.session_state.pop("np_selected_k", None)
 
-        if gmm2d_source == "ΔI from dataset.npz":
+# All controls are separate from source data and statistical model parameters.
+st.markdown('<div class="np-rule"></div>', unsafe_allow_html=True)
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Detected events", f"{n_total:,}")
+m2.metric("Valid for GMM", f"{n_valid:,}")
+m3.metric("Excluded from 2D", f"{n_excluded:,}")
+m4.metric("Companion files", f"{int(event_bytes is not None)+int(fitting_bytes is not None)} / 2")
 
-            gmm2d_dataset_columns = [
-                j
-                for j in range(X.shape[1])
-                if j != 4
-            ]
+if n_excluded:
+    st.warning(f"{n_excluded:,} events have non-finite ΔI, invalid dwell time, or "
+               "non-positive dwell. They remain in the source data and will be "
+               "recorded in the export; they are not assigned to a GMM cluster.")
 
-            gmm2d_dataset_col = st.selectbox(
-                "dataset.npz ΔI column for 2D GMM",
-                options=gmm2d_dataset_columns,
-                index=(
-                    gmm2d_dataset_columns.index(0)
-                    if 0 in gmm2d_dataset_columns
-                    else 0
-                ),
-                format_func=lambda j: "ΔI" if j == 0 else f"X[:, {j}]",
-                help=(
-                    "X[:,0] is the event blockade height ΔI for your current dataset layout. "
-                    "Do not choose the dwell-time column X[:,4]."
-                ),
-            )
+tabs = st.tabs(["01  Data", "02  Model selection", "03  Populations",
+                "04  Topology", "05  Export"])
 
-            gmm2d_delta_i = np.asarray(
-                X[:, gmm2d_dataset_col],
-                dtype=float,
-            )
+# ── DATA ──────────────────────────────────────────────────────
+with tabs[0]:
+    st.subheader("Dataset overview")
+    st.caption("Inspect the original measurements before fitting a model.")
+    with st.expander("Source validation and column mapping"):
+        for note in data["notes"]:
+            st.write("✓", note)
+        st.write(f"X shape: {data['X'].shape}; dwell input unit: {unit}.")
+        st.write("The default feature mapping is X[:,4] for dwell and X[:,0] for ΔI.")
+        st.caption("Only load NPZ files from trusted sources because NanoSense "
+                   "archives may contain Python object arrays.")
+    a, b = st.columns([1.1, 2.2], gap="large")
+    with a:
+        st.markdown("#### Raw distributions")
+        metric = st.selectbox("Histogram variable", ["Dwell time", "ΔI"],
+                              key="raw_metric")
+        values = data["dwell_ms"] if metric == "Dwell time" else data["delta_i"]
+        values = values[data["valid"]]
+        fig, ax = new_figure((5.8, 4.1))
+        ax.hist(values, bins=70, color="#3CB8AE", alpha=.85, edgecolor="none")
+        ax.set_xlabel("Dwell time (ms)" if metric == "Dwell time" else "ΔI (nA)")
+        ax.set_ylabel("Number of events")
+        ax.set_title("All valid events")
+        fig.tight_layout()
+        render_figure(fig)
+        st.caption(f"Median dwell: {fmt(np.median(data['dwell_ms'][data['valid']]),4)} ms")
+    with b:
+        st.markdown("#### Dwell–blockade landscape")
+        c1, c2 = st.columns(2)
+        with c1:
+            density_log = st.toggle("Logarithmic dwell axis", value=False)
+        with c2:
+            density_smooth = st.slider("KDE smoothing", .5, 2.0, 1.0, .1)
+        plot_density(data["dwell_ms"], data["delta_i"], density_log, density_smooth)
 
-            gmm2d_delta_i_name = (
-                "ΔI (nA)"
-                if gmm2d_dataset_col == 0
-                else f"dataset.npz X[:, {gmm2d_dataset_col}]"
-            )
-
-        elif gmm2d_source == "Peak segment ΔI from event_fitting":
-
-            gmm2d_delta_i = np.asarray(
-                derived_metrics[
-                    "Peak segment ΔI"
-                ],
-                dtype=float,
-            )
-
-            gmm2d_delta_i_name = (
-                "Peak segment ΔI from event_fitting"
-            )
-
-        else:
-
-            gmm2d_delta_i = np.asarray(
-                derived_metrics[
-                    "Time-weighted segment ΔI"
-                ],
-                dtype=float,
-            )
-
-            gmm2d_delta_i_name = (
-                "Time-weighted segment ΔI from event_fitting"
-            )
-
-        st.caption(
-            "The GMM uses the stored ΔI scale directly. Because both features "
-            "are standardized, changing nA to pA would not change the assignments."
-        )
-
-        st.divider()
-
-        run_bic_selection = st.checkbox(
-            "Check how many 2D Gaussian components BIC prefers",
-            value=False,
-            key="run_2d_bic_selection_v143",
-            help=(
-                "Fits K = 1 up to the selected maximum using the same "
-                "log10(dwell) + ΔI preprocessing. Lower BIC is better. "
-                "This is exploratory model selection and does not prove the "
-                "same number of physical nanopore mechanisms."
-            ),
-        )
-
-        bic_max_components = st.slider(
-            "Maximum number of components to test",
-            min_value=2,
-            max_value=6,
-            value=5,
-            step=1,
-            key="bic_max_components_v143",
-            disabled=not run_bic_selection,
-        )
-
-        st.caption(
-            "BIC adds a penalty for extra model complexity, so it does not "
-            "automatically reward adding more and more Gaussian components."
-        )
-
-    bic2d_result = None
-
-    if run_bic_selection:
-
+# ── MODEL SELECTION ───────────────────────────────────────────
+with tabs[1]:
+    st.subheader("BIC-guided model selection")
+    st.caption("Fit independent full-covariance GMMs to standardized "
+               "[log₁₀(dwell ms), ΔI]. No forced two-component analysis.")
+    with st.form("fit_form"):
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            max_k = st.slider("Maximum K to test", 2, 10, 6)
+        with c2:
+            st.markdown("**Fixed fitting settings**")
+            st.caption("Full covariance · 10 initializations · random state 0 · "
+                       "regularization 10⁻⁶. The same settings are used for every K.")
+        run_fit = st.form_submit_button("Fit and compare models", type="primary",
+                                        disabled=n_valid < 20)
+    if run_fit:
         try:
-
-            with st.spinner(
-                "Comparing 2D GMMs with BIC..."
-            ):
-
-                bic2d_result = select_2d_gmm_components_bic(
-                    dwell_ms,
-                    gmm2d_delta_i,
-                    max_components=bic_max_components,
-                )
-
+            with st.spinner("Fitting candidate Gaussian mixtures…"):
+                fitted = fit_cached(data["dwell_ms"], data["delta_i"], max_k)
+            st.session_state["np_fit"] = {"source": source_id, "fit": fitted}
+            st.session_state.pop("np_selected_k", None)
+            st.session_state.pop("np_export", None)
         except Exception as exc:
+            st.error(f"Model fitting failed: {exc}")
 
-            with gmm2d_result_col:
-
-                st.warning(
-                    f"BIC model selection could not be completed: {exc}"
-                )
-
-    bic_selected_result = None
-    bic_selected_k = None
-
-    gmm2d_result = None
-
-    try:
-
-        gmm2d_result = fit_2d_gmm(
-            dwell_ms,
-            gmm2d_delta_i,
+    fit_state = st.session_state.get("np_fit")
+    if fit_state and fit_state["source"] == source_id:
+        bic = fit_state["fit"]
+        best_k = int(bic["best_k"])
+        tested = [int(k) for k in bic["table"]["Components (K)"]]
+        if st.session_state.get("np_selected_k") not in tested:
+            st.session_state["np_selected_k"] = best_k
+        selected_k = st.selectbox(
+            "K to use for population analysis", tested,
+            format_func=lambda k: f"K = {k}" + (" · BIC minimum" if k == best_k else ""),
+            key="np_selected_k"
         )
-
-    except Exception as exc:
-
-        with gmm2d_result_col:
-            st.warning(
-                f"2D GMM could not be fitted: {exc}"
-            )
-
-    if bic2d_result is not None:
-
-        with gmm2d_result_col:
-
-            best_k = int(
-                bic2d_result["best_k"]
-            )
-
-            st.markdown(
-                "#### BIC component-number check"
-            )
-
-            st.metric(
-                "BIC-preferred number of Gaussian components",
-                f"K = {best_k}",
-            )
-
-            if best_k == 1:
-
-                st.info(
-                    "BIC prefers one Gaussian component in this 2D feature space. "
-                    "A forced two-component split may therefore be over-splitting "
-                    "a single statistical population."
-                )
-
-            elif best_k == 2:
-
-                st.success(
-                    "BIC prefers two Gaussian components. This supports using the "
-                    "current two-component 2D GMM as the simplest preferred model."
-                )
-
-            else:
-
-                st.warning(
-                    f"BIC prefers **{best_k} Gaussian components**. The current "
-                    "Short-like/Long-like analysis below still intentionally fits "
-                    "two components for a directly comparable two-population split. "
-                    "The BIC result says that two Gaussians may be an oversimplified "
-                    "statistical description of this dataset."
-                )
-
-            with st.expander(
-                "Show BIC values and plot",
-                expanded=True,
-            ):
-
-                bic_table = bic2d_result[
-                    "table"
-                ].copy()
-
-                st.dataframe(
-                    bic_table.style.format(
-                        {
-                            "BIC": "{:.1f}",
-                            "ΔBIC from best": "{:.1f}",
-                        }
-                    ),
-                    hide_index=True,
-                    use_container_width=True,
-                )
-
-                fig_bic, ax_bic = plt.subplots(
-                    figsize=(6.6, 4.0)
-                )
-
-                ax_bic.plot(
-                    bic_table["Components (K)"],
-                    bic_table["BIC"],
-                    marker="o",
-                    linewidth=1.8,
-                )
-
-                ax_bic.axvline(
-                    best_k,
-                    linestyle="--",
-                    linewidth=1.4,
-                    label=f"Minimum BIC: K = {best_k}",
-                )
-
-                ax_bic.set_xlabel(
-                    "Number of Gaussian components (K)"
-                )
-
-                ax_bic.set_ylabel(
-                    "BIC"
-                )
-
-                ax_bic.set_title(
-                    "2D GMM model selection by BIC"
-                )
-
-                ax_bic.set_xticks(
-                    bic_table["Components (K)"]
-                )
-
-                ax_bic.legend()
-
-                fig_bic.tight_layout()
-
-                st.pyplot(
-                    fig_bic,
-                    clear_figure=True,
-                )
-
-                st.caption(
-                    "Lower BIC is better. ΔBIC is measured relative to the best "
-                    "candidate model. The comparison uses the same standardized "
-                    "[log10(dwell time), ΔI] feature space as the 2D GMM."
-                )
-
-            st.caption(
-                "Important: BIC chooses the number of Gaussian components that "
-                "best balances fit and model complexity. It does not by itself "
-                "tell us how many physical DNA-translocation mechanisms exist."
-            )
-
-            tested_k_values = [
-                int(value)
-                for value in bic2d_result["table"]["Components (K)"].tolist()
-            ]
-
-            bic_selected_k = st.selectbox(
-                "Choose K for the population split",
-                options=tested_k_values,
-                index=tested_k_values.index(best_k),
-                key="bic_user_selected_k_v145",
-                help=(
-                    "BIC's preferred K is selected by default. You can choose any "
-                    "K that was tested above; the app will display and export the "
-                    "GMM populations for that chosen K."
-                ),
-            )
-            bic_selected_k = int(bic_selected_k)
-
-            if bic_selected_k == best_k:
-                st.success(
-                    f"Using **K = {bic_selected_k}**, which is the BIC-preferred model."
-                )
-            else:
-                selected_row = bic2d_result["table"].loc[
-                    bic2d_result["table"]["Components (K)"] == bic_selected_k
-                ].iloc[0]
-                st.info(
-                    f"You selected **K = {bic_selected_k}** while BIC prefers "
-                    f"**K = {best_k}**. For the selected model, ΔBIC = "
-                    f"**{float(selected_row['ΔBIC from best']):.1f}**."
-                )
-
-            try:
-                bic_selected_result = build_bic_selected_population_result(
-                    bic2d_result,
-                    dwell_ms,
-                    gmm2d_delta_i,
-                    selected_k=bic_selected_k,
-                )
-            except Exception as exc:
-                bic_selected_result = None
-                st.warning(
-                    f"The selected-K population split could not be built: {exc}"
-                )
-
-            show_bic_selected_split = st.checkbox(
-                "Show the population split for the chosen K",
-                value=True,
-                key="show_bic_selected_split_v145",
-                help=(
-                    "Shows the model for the K chosen above. BIC's preferred K is the "
-                    "default. For K > 2, groups are shown as Cluster 1, Cluster 2, ... "
-                    "ordered by median dwell time."
-                ),
-            )
-
-            if (
-                show_bic_selected_split
-                and bic_selected_result is not None
-            ):
-
-                st.markdown(
-                    f"#### Selected population split — K = {bic_selected_k}"
-                )
-
-                if bic_selected_k == 1:
-                    st.info(
-                        "K = 1 contains one Gaussian component, so this chosen model "
-                        "does not split the valid events into multiple clusters."
-                    )
-
-                bic_counts = bic_selected_result["counts"]
-                bic_medians = bic_selected_result["median_dwell_ms"]
-                bic_means_dwell = bic_selected_result["mean_dwell_ms"]
-                bic_means_delta = bic_selected_result["mean_delta_i"]
-
-                bic_population_table = pd.DataFrame(
-                    {
-                        "Cluster": [
-                            f"Cluster {i + 1}"
-                            for i in range(bic_selected_k)
-                        ],
-                        "Events": bic_counts,
-                        "% of valid events": (
-                            100.0 * bic_counts / np.sum(bic_counts)
-                        ),
-                        "Median dwell (ms)": bic_medians,
-                        "Mean dwell (ms)": bic_means_dwell,
-                        "Mean ΔI (nA)": bic_means_delta,
-                    }
-                )
-
-                st.dataframe(
-                    bic_population_table.style.format(
-                        {
-                            "% of valid events": "{:.1f}",
-                            "Median dwell (ms)": "{:.4f}",
-                            "Mean dwell (ms)": "{:.4f}",
-                            "Mean ΔI (nA)": "{:.4g}",
-                        }
-                    ),
-                    hide_index=True,
-                    use_container_width=True,
-                )
-
-                bic_assignment_probability = bic_selected_result[
-                    "assignment_probability"
-                ]
-
-                st.write(
-                    f"**Median posterior assignment probability:** "
-                    f"{100 * np.median(bic_assignment_probability):.1f}%  \n"
-                    f"**Events with assignment probability < 70%:** "
-                    f"{100 * np.mean(bic_assignment_probability < 0.70):.1f}%"
-                )
-
-                bic_plot_log_x = st.toggle(
-                    "Logarithmic dwell-time axis for selected-K split",
-                    value=False,
-                    key="bic_selected_plot_log_x_v145",
-                )
-
-                bic_valid_idx = bic_selected_result["valid_idx"]
-                bic_x_valid = dwell_ms[bic_valid_idx]
-                bic_y_valid = gmm2d_delta_i[bic_valid_idx]
-
-                bic_x_low, bic_x_high = np.percentile(
-                    bic_x_valid,
-                    [0.2, 99.8],
-                )
-                bic_y_low, bic_y_high = np.percentile(
-                    bic_y_valid,
-                    [0.2, 99.8],
-                )
-
-                if bic_plot_log_x:
-                    bic_gx = np.geomspace(
-                        max(float(bic_x_low), np.finfo(float).tiny),
-                        float(bic_x_high),
-                        220,
-                    )
-                else:
-                    bic_gx = np.linspace(
-                        float(bic_x_low),
-                        float(bic_x_high),
-                        220,
-                    )
-
-                bic_gy = np.linspace(
-                    float(bic_y_low),
-                    float(bic_y_high),
-                    220,
-                )
-
-                BIC_GX, BIC_GY = np.meshgrid(
-                    bic_gx,
-                    bic_gy,
-                )
-
-                bic_grid_features = np.column_stack(
-                    [
-                        np.log10(BIC_GX.ravel()),
-                        BIC_GY.ravel(),
-                    ]
-                )
-
-                bic_grid_scaled = bic_selected_result[
-                    "scaler"
-                ].transform(
-                    bic_grid_features
-                )
-
-                bic_grid_raw_labels = bic_selected_result[
-                    "model"
-                ].predict(
-                    bic_grid_scaled
-                )
-
-                bic_grid_labels = bic_selected_result[
-                    "raw_to_ordered"
-                ][bic_grid_raw_labels].reshape(
-                    BIC_GX.shape
-                )
-
-                fig_bic_split, ax_bic_split = plt.subplots(
-                    figsize=(9, 5.4)
-                )
-
-                for cluster in range(bic_selected_k):
-                    cluster_idx = bic_selected_result[
-                        "cluster_indices"
-                    ][cluster]
-
-                    ax_bic_split.scatter(
-                        dwell_ms[cluster_idx],
-                        gmm2d_delta_i[cluster_idx],
-                        s=13,
-                        alpha=0.45,
-                        label=(
-                            f"Cluster {cluster + 1} "
-                            f"({len(cluster_idx):,})"
-                        ),
-                    )
-
-                if bic_selected_k > 1:
-                    boundary_levels = np.arange(
-                        0.5,
-                        bic_selected_k - 0.5,
-                        1.0,
-                    )
-
-                    ax_bic_split.contour(
-                        BIC_GX,
-                        BIC_GY,
-                        bic_grid_labels,
-                        levels=boundary_levels,
-                        linewidths=1.5,
-                        linestyles="--",
-                    )
-
-                if bic_plot_log_x:
-                    ax_bic_split.set_xscale("log")
-
-                ax_bic_split.set_xlabel("Dwell time (ms)")
-                ax_bic_split.set_ylabel(gmm2d_delta_i_name)
-                ax_bic_split.set_title(
-                    f"Selected-K 2D GMM classification (K = {bic_selected_k})"
-                )
-                ax_bic_split.legend()
-                fig_bic_split.tight_layout()
-
-                st.pyplot(
-                    fig_bic_split,
-                    clear_figure=True,
-                )
-
-                st.caption(
-                    "The point colours show the populations from the chosen-K model. "
-                    "model. Clusters are numbered from shortest to longest median "
-                    "dwell time. Dashed contours mark changes in the most-probable "
-                    "Gaussian component; for K > 2 there is no single universal "
-                    "50/50 boundary separating all populations."
-                )
-
-            st.divider()
-
-    if gmm2d_result is not None:
-
-        gmm2d_short_idx = gmm2d_result[
-            "short_idx"
-        ]
-
-        gmm2d_long_idx = gmm2d_result[
-            "long_idx"
-        ]
-
-        gmm2d_valid = gmm2d_result[
-            "valid"
-        ]
-
-        gmm2d_unclassified = int(
-            np.sum(~gmm2d_valid)
+        selected_k = int(selected_k)
+        result = build_bic_selected_population_result(
+            bic, data["dwell_ms"], data["delta_i"], selected_k=selected_k
         )
-
-        with gmm2d_result_col:
-
-            metric_2d_a, metric_2d_b, metric_2d_c = st.columns(3)
-
-            metric_2d_a.metric(
-                "2D Short-like",
-                f"{len(gmm2d_short_idx):,}",
-            )
-
-            metric_2d_a.caption(
-                f"{100 * len(gmm2d_short_idx) / n_events:.1f}% of all events"
-            )
-
-            metric_2d_b.metric(
-                "2D Long-like",
-                f"{len(gmm2d_long_idx):,}",
-            )
-
-            metric_2d_b.caption(
-                f"{100 * len(gmm2d_long_idx) / n_events:.1f}% of all events"
-            )
-
-            metric_2d_c.metric(
-                "No valid ΔI",
-                f"{gmm2d_unclassified:,}",
-            )
-
-            if gmm2d_unclassified:
-                metric_2d_c.caption(
-                    "Not assigned by the 2D model"
-                )
-
-            compare_mask = gmm2d_valid
-
-            split_1d_short = (
-                dwell_ms <= cutoff_ms
-            )
-
-            split_2d_short = (
-                gmm2d_result["labels"] == 0
-            )
-
-            agreement = float(
-                np.mean(
-                    split_1d_short[compare_mask]
-                    == split_2d_short[compare_mask]
-                )
-            )
-
-            assignment_probability = np.maximum(
-                gmm2d_result["p_short"][compare_mask],
-                gmm2d_result["p_long"][compare_mask],
-            )
-
-            median_assignment_probability = float(
-                np.median(assignment_probability)
-            )
-
-            uncertain_fraction = float(
-                np.mean(
-                    assignment_probability < 0.70
-                )
-            )
-
-            st.write(
-                f"**Agreement with the current 1D dwell split:** "
-                f"{100 * agreement:.1f}%  \n"
-                f"**Median posterior assignment probability:** "
-                f"{100 * median_assignment_probability:.1f}%  \n"
-                f"**Events with assignment probability < 70%:** "
-                f"{100 * uncertain_fraction:.1f}%"
-            )
-
-            st.caption(
-                "Approximate 2D GMM centres — "
-                f"Short-like: {gmm2d_result['short_centre_dwell_ms']:.4f} ms, "
-                f"ΔI = {gmm2d_result['short_centre_delta_i']:.4g}; "
-                f"Long-like: {gmm2d_result['long_centre_dwell_ms']:.4f} ms, "
-                f"ΔI = {gmm2d_result['long_centre_delta_i']:.4g}."
-            )
-
-            st.info(
-                "For the 2D split, Short-like and Long-like are cluster names. "
-                "There is no single dwell-time cutoff because ΔI also contributes "
-                "to each event's assignment."
-            )
-
-    # ========================================================
-    # PLOTS
-    # ========================================================
-
-    with plot_col:
-
-        st.subheader(
-            "Event population plots"
-        )
-
-        plot_type = st.radio(
-
-            "Plot type",
-
-            [
-                "Dwell histogram",
-                "Dwell density (KDE)",
-                "2D GMM classification",
-                "2D event density",
-            ],
-
-            horizontal=True,
-        )
-
-        # ====================================================
-        # A. HISTOGRAM
-        # ====================================================
-
-        if plot_type == "Dwell histogram":
-
-            hist_view = st.radio(
-                "Population view",
-                [
-                    "All",
-                    "Short",
-                    "Long",
-                    "Short + Long overlay",
-                ],
-                horizontal=True,
-                key="hist_population_view",
-            )
-
-            log_axis = st.toggle(
-                "Logarithmic dwell-time axis",
-                value=True,
-                key="hist_log_axis",
-            )
-
-            if hist_view == "Short":
-                hist_values = dwell_ms[short_idx]
-            elif hist_view == "Long":
-                hist_values = dwell_ms[long_idx]
-            else:
-                hist_values = dwell_ms
-
-            fig, ax = plt.subplots(
-                figsize=(9, 4.8)
-            )
-
-            if log_axis:
-
-                positive_values = hist_values[
-                    np.isfinite(hist_values)
-                    & (hist_values > 0)
-                ]
-
-                if len(positive_values) == 0:
-                    st.warning(
-                        "No positive dwell times are available "
-                        "for a logarithmic histogram."
-                    )
-                    st.stop()
-
-                n_log_bins = st.slider(
-                    "Number of log-spaced bins",
-                    min_value=25,
-                    max_value=150,
-                    value=70,
-                    step=5,
-                    key="hist_log_bins",
-                )
-
-                bins = np.logspace(
-                    np.log10(np.min(positive_values)),
-                    np.log10(np.max(positive_values)),
-                    n_log_bins,
-                )
-
-                if hist_view == "Short + Long overlay":
-
-                    ax.hist(
-                        dwell_ms[short_idx],
-                        bins=bins,
-                        alpha=0.55,
-                        label=f"Short ({len(short_idx):,})",
-                    )
-
-                    ax.hist(
-                        dwell_ms[long_idx],
-                        bins=bins,
-                        alpha=0.55,
-                        label=f"Long ({len(long_idx):,})",
-                    )
-
-                else:
-
-                    ax.hist(
-                        hist_values,
-                        bins=bins,
-                        alpha=0.85,
-                        label=f"{hist_view} ({len(hist_values):,})",
-                    )
-
-                ax.set_xscale(
-                    "log"
-                )
-
-            else:
-
-                bin_control = st.radio(
-                    "Histogram bin control",
-                    [
-                        "Number of bins",
-                        "Bin width (ms)",
-                    ],
-                    index=0,
-                    horizontal=True,
-                    key="hist_bin_control",
-                    help=(
-                        "Choose the total number of histogram bins directly, "
-                        "or specify an exact dwell-time bin width in milliseconds."
-                    ),
-                )
-
-                if bin_control == "Number of bins":
-
-                    n_bins = st.slider(
-                        "Number of bins",
-                        min_value=10,
-                        max_value=200,
-                        value=50,
-                        step=5,
-                        key="hist_n_bins",
-                    )
-
-                    finite_hist_values = np.asarray(
-                        hist_values,
-                        dtype=float,
-                    )
-
-                    finite_hist_values = finite_hist_values[
-                        np.isfinite(
-                            finite_hist_values
-                        )
-                    ]
-
-                    if len(finite_hist_values) == 0:
-
-                        st.warning(
-                            "No finite dwell times are available "
-                            "for this histogram."
-                        )
-
-                        st.stop()
-
-                    bins = np.histogram_bin_edges(
-                        finite_hist_values,
-                        bins=int(n_bins),
-                    )
-
-                else:
-
-                    default_width = float(
-                        max(
-                            dwell_resolution_ms,
-                            0.001,
-                        )
-                    )
-
-                    bin_width_ms = st.number_input(
-                        "Histogram bin width (ms)",
-                        min_value=0.001,
-                        value=default_width,
-                        step=default_width,
-                        format="%.5f",
-                        key="hist_bin_width",
-                        help=(
-                            "This sets the physical dwell-time width "
-                            "of every histogram bin."
-                        ),
-                    )
-
-                    bins = linear_histogram_edges(
-                        hist_values,
-                        bin_width_ms,
-                    )
-
-                if hist_view == "Short + Long overlay":
-
-                    ax.hist(
-                        dwell_ms[short_idx],
-                        bins=bins,
-                        alpha=0.55,
-                        label=f"Short ({len(short_idx):,})",
-                    )
-
-                    ax.hist(
-                        dwell_ms[long_idx],
-                        bins=bins,
-                        alpha=0.55,
-                        label=f"Long ({len(long_idx):,})",
-                    )
-
-                else:
-
-                    ax.hist(
-                        hist_values,
-                        bins=bins,
-                        alpha=0.85,
-                        label=f"{hist_view} ({len(hist_values):,})",
-                    )
-
-            ax.axvline(
-                cutoff_ms,
-                linestyle="--",
-                linewidth=2,
-                label=f"Cutoff = {cutoff_ms:.4f} ms",
-            )
-
-            ax.set_xlabel(
-                "Dwell time (ms)"
-            )
-
-            ax.set_ylabel(
-                "Count"
-            )
-
-            ax.set_title(
-                f"{hist_view} dwell-time distribution"
-            )
-
-            ax.legend()
-
-            fig.tight_layout()
-
-            hist_x_default = ax.get_xlim()
-            hist_y_default = ax.get_ylim()
-
-            hist_x_range, hist_y_range = axis_limit_controls(
-                "hist",
-                hist_x_default,
-                hist_y_default,
-                log_x=log_axis,
-            )
-
-            apply_axis_limits(
-                ax,
-                hist_x_range,
-                hist_y_range,
-            )
-
-            st.pyplot(
-                fig,
-                clear_figure=True,
-            )
-
-            if not log_axis:
-                st.caption(
-                    "For linear histograms you can now choose either the "
-                    "**number of bins** directly or an exact **bin width (ms)**. "
-                    "The same bin edges are used for Short/Long overlays so the "
-                    "two populations remain directly comparable."
-                )
-
-        # ====================================================
-        # B. KDE DWELL DENSITY
-        # ====================================================
-
-        elif plot_type == "Dwell density (KDE)":
-
-            log_axis = st.toggle(
-
-                "Fit density in log10(dwell time)",
-
-                value=True,
-
-                key="kde_log_axis",
-
-                help=(
-                    "Recommended for nanopore dwell times "
-                    "because the distribution is usually "
-                    "strongly right-skewed."
-                ),
-            )
-
-            density_view = st.radio(
-
-                "Show",
-
-                [
-                    "Short + Long",
-                    "All events",
-                ],
-
-                horizontal=True,
-            )
-
-            fig, ax = plt.subplots(
-                figsize=(9, 4.8)
-            )
-
-            # ------------------------------------------------
-            # ALL EVENTS
-            # ------------------------------------------------
-
-            if density_view == "All events":
-
-                x_all, d_all = kde_curve(
-                    dwell_ms,
-                    log_axis,
-                )
-
-                if x_all is not None:
-
-                    ax.plot(
-
-                        x_all,
-                        d_all,
-
-                        linewidth=2,
-
-                        label=
-                        "All events",
-                    )
-
-            # ------------------------------------------------
-            # SHORT AND LONG SEPARATELY
-            # ------------------------------------------------
-
-            else:
-
-                if len(short_idx) >= 2:
-
-                    (
-                        x_short,
-                        d_short,
-                    ) = kde_curve(
-
-                        dwell_ms[
-                            short_idx
-                        ],
-
-                        log_axis,
-                    )
-
-                    if x_short is not None:
-
-                        ax.plot(
-
-                            x_short,
-                            d_short,
-
-                            linewidth=2,
-
-                            label=
-                            f"Short "
-                            f"({len(short_idx):,})",
-                        )
-
-                if len(long_idx) >= 2:
-
-                    (
-                        x_long,
-                        d_long,
-                    ) = kde_curve(
-
-                        dwell_ms[
-                            long_idx
-                        ],
-
-                        log_axis,
-                    )
-
-                    if x_long is not None:
-
-                        ax.plot(
-
-                            x_long,
-                            d_long,
-
-                            linewidth=2,
-
-                            label=
-                            f"Long "
-                            f"({len(long_idx):,})",
-                        )
-
-            # ------------------------------------------------
-            # CUT-OFF LINE
-            # ------------------------------------------------
-
-            ax.axvline(
-
-                cutoff_ms,
-
-                linestyle="--",
-
-                linewidth=2,
-
-                label=
-                f"Cutoff = "
-                f"{cutoff_ms:.4f} ms",
-            )
-
-            if log_axis:
-
-                ax.set_xscale(
-                    "log"
-                )
-
-                ax.set_ylabel(
-                    "KDE density in log10(dwell time)"
-                )
-
-            else:
-
-                ax.set_ylabel(
-                    "KDE density"
-                )
-
-            ax.set_xlabel(
-                "Dwell time (ms)"
-            )
-
-            ax.legend()
-
-            fig.tight_layout()
-
-            kde_x_default = ax.get_xlim()
-            kde_y_default = ax.get_ylim()
-
-            kde_x_range, kde_y_range = axis_limit_controls(
-                "kde",
-                kde_x_default,
-                kde_y_default,
-                log_x=log_axis,
-            )
-
-            apply_axis_limits(
-                ax,
-                kde_x_range,
-                kde_y_range,
-            )
-
-            st.pyplot(
-                fig,
-                clear_figure=True,
-            )
-
-            st.caption(
-
-                "The KDE is a smoothed view of the dwell-time "
-                "distribution. Use it together with the histogram "
-                "and 2D density plot when deciding the split."
-            )
-
-        # ====================================================
-        # C. 2D GMM CLASSIFICATION - MATPLOTLIB
-        # ====================================================
-
-        elif plot_type == "2D GMM classification":
-
-            if gmm2d_result is None:
-
-                st.warning(
-                    "The 2D GMM is not available for this dataset / ΔI source."
-                )
-
-            else:
-
-                st.caption(
-                    "Matplotlib view of the 2D GMM assignments. The dashed contour "
-                    "is the 50/50 posterior boundary between the two fitted components."
-                )
-
-                gmm_plot_log_x = st.toggle(
-                    "Logarithmic dwell-time axis",
-                    value=False,
-                    key="gmm2d_plot_log_x",
-                )
-
-                valid_idx = gmm2d_result[
-                    "valid_idx"
-                ]
-
-                short_plot_idx = gmm2d_result[
-                    "short_idx"
-                ]
-
-                long_plot_idx = gmm2d_result[
-                    "long_idx"
-                ]
-
-                x_valid = dwell_ms[
-                    valid_idx
-                ]
-
-                y_valid = gmm2d_delta_i[
-                    valid_idx
-                ]
-
-                x_low, x_high = np.percentile(
-                    x_valid,
-                    [0.2, 99.8],
-                )
-
-                y_low, y_high = np.percentile(
-                    y_valid,
-                    [0.2, 99.8],
-                )
-
-                if gmm_plot_log_x:
-                    gx = np.geomspace(
-                        max(float(x_low), np.finfo(float).tiny),
-                        float(x_high),
-                        260,
-                    )
-                else:
-                    gx = np.linspace(
-                        float(x_low),
-                        float(x_high),
-                        260,
-                    )
-
-                gy = np.linspace(
-                    float(y_low),
-                    float(y_high),
-                    260,
-                )
-
-                GX, GY = np.meshgrid(
-                    gx,
-                    gy,
-                )
-
-                grid_features = np.column_stack(
-                    [
-                        np.log10(GX.ravel()),
-                        GY.ravel(),
-                    ]
-                )
-
-                grid_scaled = gmm2d_result[
-                    "scaler"
-                ].transform(
-                    grid_features
-                )
-
-                grid_p_short = gmm2d_result[
-                    "model"
-                ].predict_proba(
-                    grid_scaled
-                )[
-                    :,
-                    gmm2d_result["short_component"],
-                ].reshape(
-                    GX.shape
-                )
-
-                fig, ax = plt.subplots(
-                    figsize=(9, 5.4)
-                )
-
-                ax.scatter(
-                    dwell_ms[short_plot_idx],
-                    gmm2d_delta_i[short_plot_idx],
-                    s=13,
-                    alpha=0.45,
-                    label=f"2D Short-like ({len(short_plot_idx):,})",
-                )
-
-                ax.scatter(
-                    dwell_ms[long_plot_idx],
-                    gmm2d_delta_i[long_plot_idx],
-                    s=13,
-                    alpha=0.45,
-                    label=f"2D Long-like ({len(long_plot_idx):,})",
-                )
-
-                ax.contour(
-                    GX,
-                    GY,
-                    grid_p_short,
-                    levels=[0.5],
-                    linewidths=2.0,
-                    linestyles="--",
-                )
-
-                if gmm_plot_log_x:
-                    ax.set_xscale(
-                        "log"
-                    )
-
-                ax.set_xlabel(
-                    "Dwell time (ms)"
-                )
-
-                ax.set_ylabel(
-                    gmm2d_delta_i_name
-                )
-
-                ax.set_title(
-                    "2D GMM classification: dwell time + ΔI"
-                )
-
-                ax.legend()
-
-                fig.tight_layout()
-
-                gmm2d_x_default = ax.get_xlim()
-                gmm2d_y_default = ax.get_ylim()
-
-                gmm2d_x_range, gmm2d_y_range = axis_limit_controls(
-                    "gmm2d_classification",
-                    gmm2d_x_default,
-                    gmm2d_y_default,
-                    log_x=gmm_plot_log_x,
-                )
-
-                apply_axis_limits(
-                    ax,
-                    gmm2d_x_range,
-                    gmm2d_y_range,
-                )
-
-                st.pyplot(
-                    fig,
-                    clear_figure=True,
-                )
-
-                st.caption(
-                    "The point colours show the 2D GMM assignment. The dashed "
-                    "boundary marks equal posterior probability. Unlike the 1D "
-                    "split, this boundary can curve because both dwell time and ΔI "
-                    "are used."
-                )
-
-        # ====================================================
-        # D. 2D EVENT DENSITY
-        # ====================================================
-
-        elif plot_type == "2D event density":
-
-            st.caption(
-                "Smooth 2D Gaussian KDE of dwell time versus the selected "
-                "event metric. Linear dwell time is the default for the classic "
-                "glowing ΔI–Δt density-map appearance."
-            )
-
-            # ------------------------------------------------
-            # AVAILABLE Y METRICS
-            # ------------------------------------------------
-
-            # ------------------------------------------------
-            # Y-AXIS SOURCE
-            # ------------------------------------------------
-            #
-            # The event_fitting file gives segment-derived ΔI values.
-            # The dataset.npz file also contains the reduced event feature
-            # matrix X.  For this dataset, X[:,0] is used as the default
-            # dataset ΔI feature.  The column remains user-selectable so the
-            # app is robust to other NanoSense dataset layouts.
-            # ------------------------------------------------
-
-            y_source = st.selectbox(
-                "Y-axis source",
-                [
-                    "ΔI from dataset.npz",
-                    "Peak segment ΔI from event_fitting",
-                    "Time-weighted segment ΔI from event_fitting",
-                    "Number of segments from event_fitting",
-                    "Other raw dataset column",
-                ],
-                index=0,
-                help=(
-                    "Use dataset.npz if you want the same reduced-event ΔI "
-                    "feature stored in the NanoSense dataset. "
-                    "event_fitting options calculate ΔI from fitted segments."
-                ),
-            )
-
-            if y_source == "ΔI from dataset.npz":
-
-                dataset_delta_i_col = st.selectbox(
-                    "dataset.npz ΔI column",
-                    options=list(range(X.shape[1])),
-                    index=0,
-                    format_func=lambda j: "ΔI" if j == 0 else f"X[:, {j}]",
-                    help=(
-                        "X[:,0] is the event blockade height ΔI for the uploaded dataset. "
-                        "This is adjustable because dataset feature layouts "
-                        "can vary between analysis/software versions."
-                    ),
-                )
-
-                y_name = (
-                    "ΔI"
-                    if dataset_delta_i_col == 0
-                    else (
-                        f"ΔI from dataset.npz "
-                        f"(X[:, {dataset_delta_i_col}])"
-                    )
-                )
-
-                y_values = np.asarray(
-                    X[:, dataset_delta_i_col],
-                    dtype=float,
-                )
-
-            elif y_source == "Peak segment ΔI from event_fitting":
-
-                y_name = "Peak segment ΔI (from event_fitting)"
-
-                y_values = np.asarray(
-                    derived_metrics[
-                        "Peak segment ΔI"
-                    ],
-                    dtype=float,
-                )
-
-            elif y_source == "Time-weighted segment ΔI from event_fitting":
-
-                y_name = "Time-weighted segment ΔI (from event_fitting)"
-
-                y_values = np.asarray(
-                    derived_metrics[
-                        "Time-weighted segment ΔI"
-                    ],
-                    dtype=float,
-                )
-
-            elif y_source == "Number of segments from event_fitting":
-
-                y_name = "Number of segments (from event_fitting)"
-
-                y_values = np.asarray(
-                    derived_metrics[
-                        "Number of segments"
-                    ],
-                    dtype=float,
-                )
-
-            else:
-
-                raw_columns = [
-                    j
-                    for j in range(X.shape[1])
-                    if j != 4
-                ]
-
-                raw_col = st.selectbox(
-                    "Raw dataset column",
-                    options=raw_columns,
-                    format_func=lambda j: f"X[:, {j}]",
-                )
-
-                y_name = f"Raw dataset X[:, {raw_col}]"
-
-                y_values = np.asarray(
-                    X[:, raw_col],
-                    dtype=float,
-                )
-
-            # ------------------------------------------------
-            # ΔI DISPLAY UNITS
-            # ------------------------------------------------
-            #
-            # For this NanoSense dataset, ΔI-like values are stored on an
-            # nA-scale.  The user can display them either in nA or pA.
-            # Conversion changes only the plotted units.
-            # ------------------------------------------------
-
-            if (
-                y_source == "ΔI from dataset.npz"
-                or y_source == "Peak segment ΔI from event_fitting"
-                or y_source == "Time-weighted segment ΔI from event_fitting"
-            ):
-
-                delta_i_unit = st.radio(
-                    "ΔI display unit",
-                    [
-                        "pA",
-                        "nA",
-                    ],
-                    index=0,
-                    horizontal=True,
-                    key="density_delta_i_unit",
-                    help=(
-                        "The underlying ΔI values are treated as nA-scale. "
-                        "Choosing pA multiplies the plotted values by 1000."
-                    ),
-                )
-
-                if delta_i_unit == "pA":
-
-                    y_values = (
-                        np.asarray(
-                            y_values,
-                            dtype=float,
-                        )
-                        * 1000.0
-                    )
-
-                    if dataset_delta_i_col == 0 and y_source == "ΔI from dataset.npz":
-
-                        y_name = "ΔI (pA)"
-
-                    elif "dataset.npz" in y_name:
-
-                        y_name = (
-                            "ΔI from dataset.npz "
-                            f"(X[:, {dataset_delta_i_col}]) (pA)"
-                        )
-
-                    elif "Peak segment" in y_name:
-
-                        y_name = (
-                            "Peak segment ΔI "
-                            "(from event_fitting) (pA)"
-                        )
-
-                    else:
-
-                        y_name = (
-                            "Time-weighted segment ΔI "
-                            "(from event_fitting) (pA)"
-                        )
-
-                else:
-
-                    if dataset_delta_i_col == 0 and y_source == "ΔI from dataset.npz":
-
-                        y_name = "ΔI (nA)"
-
-                    elif "dataset.npz" in y_name:
-
-                        y_name = (
-                            "ΔI from dataset.npz "
-                            f"(X[:, {dataset_delta_i_col}]) (nA)"
-                        )
-
-                    elif "Peak segment" in y_name:
-
-                        y_name = (
-                            "Peak segment ΔI "
-                            "(from event_fitting) (nA)"
-                        )
-
-                    else:
-
-                        y_name = (
-                            "Time-weighted segment ΔI "
-                            "(from event_fitting) (nA)"
-                        )
-
-            controls_a, controls_b = st.columns(
-                2
-            )
-
-            # ------------------------------------------------
-            # LEFT CONTROL
-            # ------------------------------------------------
-
-            with controls_a:
-
-                population_view = st.radio(
-                    "Population",
-                    [
-                        "All",
-                        "Short",
-                        "Long",
-                    ],
-                    horizontal=True,
-                )
-
-                st.caption(
-                    "Population selection controls the KDE itself: "
-                    "**Short** fits only short events, **Long** fits only long "
-                    "events, and **All** fits all events. Axis limits change only "
-                    "the displayed view."
-                )
-
-            # ------------------------------------------------
-            # RIGHT CONTROL
-            # ------------------------------------------------
-
-            with controls_b:
-
-                log_axis = st.toggle(
-                    "Logarithmic dwell-time axis",
-                    value=False,
-                    key="density2d_log_axis",
-                    help=(
-                        "Leave this off for the classic ΔI-vs-Δt density view. "
-                        "Turn it on only when you want to inspect long dwell-time tails."
-                    ),
-                )
-
-                grid_size = st.slider(
-                    "Density resolution",
-                    min_value=120,
-                    max_value=320,
-                    value=220,
-                    step=20,
-                )
-
-                kde_bandwidth_scale = st.slider(
-                    "KDE smoothing",
-                    min_value=0.40,
-                    max_value=2.00,
-                    value=0.90,
-                    step=0.05,
-                    help=(
-                        "Multiplier on Scott's automatic 2D KDE bandwidth. "
-                        "Lower values make the density cloud sharper; higher "
-                        "values make it smoother. Around 0.8–1.1 usually gives "
-                        "the classic smooth nanopore density appearance."
-                    ),
-                )
-
-                density_threshold_percent = st.slider(
-                    "Background cutoff (% of peak density)",
-                    min_value=0.0,
-                    max_value=10.0,
-                    value=0.15,
-                    step=0.05,
-                    help=(
-                        "Low-density regions below this fraction of the "
-                        "peak are hidden to give the glowing density-map look."
-                    ),
-                )
-
-            # ------------------------------------------------
-            # POPULATION SELECTION
-            # ------------------------------------------------
-
-            if population_view == "Short":
-
-                selected = short_idx
-
-            elif population_view == "Long":
-
-                selected = long_idx
-
-            else:
-
-                selected = np.arange(
-                    n_events
-                )
-
-            x_plot = dwell_ms[
-                selected
-            ]
-
-            y_plot = y_values[
-                selected
-            ]
-
-            # Keep original event IDs for optional hover inspection.
-            event_ids_plot = np.asarray(
-                selected,
-                dtype=int,
-            )
-
-            # ------------------------------------------------
-            # REMOVE NaNs
-            # ------------------------------------------------
-
-            valid = (
-                np.isfinite(
-                    x_plot
-                )
-                &
-                np.isfinite(
-                    y_plot
-                )
-            )
-
-            if log_axis:
-
-                valid &= (
-                    x_plot > 0
-                )
-
-            x_plot = x_plot[
-                valid
-            ]
-
-            y_plot = y_plot[
-                valid
-            ]
-
-            event_ids_plot = event_ids_plot[
-                valid
-            ]
-
-            if len(x_plot) == 0:
-
-                st.warning(
-                    "No finite points are available "
-                    "for this plot."
-                )
-
-            else:
-
-                # --------------------------------------------
-                # OPTIONAL OUTLIER DISPLAY FILTER
-                # --------------------------------------------
-
-                (
-                    p_low,
-                    p_high,
-                ) = st.slider(
-                    "Displayed Y percentile range",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=(
-                        0.0,
-                        100.0,
-                    ),
-                    step=0.5,
-                    help=(
-                        "Useful if a few extreme outliers squash the "
-                        "main density cloud. Keep 0–100% to display everything."
-                    ),
-                )
-
-                if (
-                    p_low > 0.0
-                    or p_high < 100.0
-                ):
-
-                    (
-                        y_low,
-                        y_high,
-                    ) = np.percentile(
-                        y_plot,
-                        [
-                            p_low,
-                            p_high,
-                        ],
-                    )
-
-                    keep = (
-                        (y_plot >= y_low)
-                        &
-                        (y_plot <= y_high)
-                    )
-
-                    x_plot = x_plot[
-                        keep
-                    ]
-
-                    y_plot = y_plot[
-                        keep
-                    ]
-
-                    event_ids_plot = event_ids_plot[
-                        keep
-                    ]
-
-                # --------------------------------------------
-                # AXIS CONTROLS
-                # --------------------------------------------
-                #
-                # IMPORTANT:
-                # Population selection determines which events are used
-                # to fit the KDE:
-                #
-                #   All   -> all selected events
-                #   Short -> dwell <= cutoff
-                #   Long  -> dwell > cutoff
-                #
-                # The axis limits below affect only what is displayed.
-                # They never change which events are used to fit the KDE.
-                # --------------------------------------------
-
-                density_x_default = (
-                    float(np.min(x_plot)),
-                    float(np.max(x_plot)),
-                )
-
-                density_y_default = (
-                    float(np.min(y_plot)),
-                    float(np.max(y_plot)),
-                )
-
-                density_x_range, density_y_range = axis_limit_controls(
-                    "density2d",
-                    density_x_default,
-                    density_y_default,
-                    log_x=log_axis,
-                )
-
-                # --------------------------------------------
-                # TRUE 2D KDE OF THE SELECTED POPULATION
-                # --------------------------------------------
-
-                x_grid, y_grid, density = true_2d_kde_density(
-                    x_plot,
-                    y_plot,
-                    log_x=log_axis,
-                    grid_size=grid_size,
-                    bandwidth_scale=kde_bandwidth_scale,
-                    x_percentiles=(0.2, 99.8),
-                    y_percentiles=(0.2, 99.8),
-                )
-
-                if density is None:
-
-                    st.warning(
-                        "Not enough valid points are available "
-                        "to calculate the density map."
-                    )
-
-                else:
-
-                    fig, ax = plt.subplots(
-                        figsize=(9, 5.4)
-                    )
-
-                    # Dark background to match the requested visual style.
-                    fig.patch.set_facecolor(
-                        "black"
-                    )
-                    ax.set_facecolor(
-                        "black"
-                    )
-
-                    threshold = (
-                        density_threshold_percent
-                        / 100.0
-                        * float(
-                            np.max(density)
-                        )
-                    )
-
-                    density_masked = np.ma.masked_where(
-                        density <= threshold,
-                        density,
-                    )
-
-                    mesh = ax.pcolormesh(
-                        x_grid,
-                        y_grid,
-                        density_masked,
-                        shading="auto",
-                        cmap="magma",
-                    )
-
-                    if log_axis:
-
-                        ax.set_xscale(
-                            "log"
-                        )
-
-                    # ----------------------------------------
-                    # CUT-OFF
-                    # ----------------------------------------
-
-                    ax.axvline(
-                        cutoff_ms,
-                        color="white",
-                        linestyle="--",
-                        linewidth=1.5,
-                        alpha=0.9,
-                        label=f"Cutoff = {cutoff_ms:.4f} ms",
-                    )
-
-                    # ----------------------------------------
-                    # COLOUR BAR
-                    # ----------------------------------------
-
-                    cbar = fig.colorbar(
-                        mesh,
-                        ax=ax,
-                    )
-
-                    cbar.set_label(
-                        "KDE density",
-                        color="white",
-                    )
-
-                    cbar.ax.tick_params(
-                        colors="white"
-                    )
-
-                    # ----------------------------------------
-                    # LABELS / DARK THEME
-                    # ----------------------------------------
-
-                    ax.set_xlabel(
-                        "Dwell time (ms)",
-                        color="white",
-                    )
-
-                    ax.set_ylabel(
-                        y_name,
-                        color="white",
-                    )
-
-                    ax.set_title(
-                        f"{population_view} events",
-                        color="white",
-                    )
-
-                    ax.tick_params(
-                        colors="white"
-                    )
-
-                    for spine in ax.spines.values():
-                        spine.set_color(
-                            "white"
-                        )
-
-                    legend = ax.legend(
-                        facecolor="black",
-                        edgecolor="white",
-                        framealpha=0.65,
-                    )
-
-                    for text_item in legend.get_texts():
-                        text_item.set_color(
-                            "white"
-                        )
-
-                    fig.tight_layout()
-
-                    apply_axis_limits(
-                        ax,
-                        density_x_range,
-                        density_y_range,
-                    )
-
-                    st.pyplot(
-                        fig,
-                        clear_figure=True,
-                    )
-
-                    st.caption(
-                        f"The KDE was fitted using **{len(x_plot):,}** events "
-                        f"from the **{population_view}** population. "
-                        "The dashed line is the dwell-time cutoff used for "
-                        "SHORT/LONG export. Axis limits and KDE smoothing affect "
-                        "only the visualization."
-                    )
-
-
-    # ========================================================
-    # 3. EXPORT
-    # ========================================================
-
-    st.subheader(
-        "3 · Export synchronized populations"
-    )
-
-    st.write(
-        "Choose whether the exported populations are defined by the original "
-        "1D dwell-time cutoff, the fixed two-component 2D GMM, or a "
-        "BIC-guided user-selected-K 2D GMM. Every exported population keeps event_data, "
-        "dataset, and event_fitting synchronized."
-    )
-
-    export_method = st.radio(
-        "Population definition used for export",
-        [
-            "1D dwell-time split",
-            "2D GMM: fixed K = 2",
-            "2D GMM: selected K after BIC",
-        ],
-        horizontal=True,
-        key="export_population_definition_v145",
-    )
-
-    default_stem = clean_stem(
-        f_dataset.name
-    )
-
-    stem = st.text_input(
-        "Output dataset name",
-        value=default_stem,
-        help="This becomes the prefix of the filtered NPZ files.",
-    ).strip()
-
-    stem = (
-        stem
-        or default_stem
-    )
-
-    export_ready = True
-    export_excluded_idx = np.array([], dtype=int)
-    export_cluster_indices = []
-
-    if export_method == "1D dwell-time split":
-
-        export_short_idx = short_idx
-        export_long_idx = long_idx
-
-        if (
-            not len(export_short_idx)
-            or not len(export_long_idx)
-        ):
-            st.warning(
-                "Both 1D populations must contain at least one event before export."
-            )
-            export_ready = False
-
-    elif export_method == "2D GMM: fixed K = 2":
-
-        if gmm2d_result is None:
-            st.warning(
-                "The fixed two-component 2D GMM is not available, so these "
-                "populations cannot be exported."
-            )
-            export_ready = False
-            export_short_idx = np.array([], dtype=int)
-            export_long_idx = np.array([], dtype=int)
-
-        else:
-            export_short_idx = gmm2d_result["short_idx"]
-            export_long_idx = gmm2d_result["long_idx"]
-            export_excluded_idx = np.flatnonzero(
-                ~gmm2d_result["valid"]
-            )
-
-            n_unclassified_2d = int(len(export_excluded_idx))
-
-            if n_unclassified_2d:
-                excluded_fraction = (
-                    100.0 * n_unclassified_2d / n_events
-                )
-
-                st.warning(
-                    f"{n_unclassified_2d:,} of {n_events:,} events "
-                    f"({excluded_fraction:.3f}%) cannot be classified by the "
-                    "2D GMM because dwell time and/or ΔI is invalid."
-                )
-
-                st.caption(
-                    "These events will never be silently assigned. If you "
-                    "continue, they are omitted from the population NPZ files "
-                    "and recorded in excluded_events.csv."
-                )
-
-                exclude_unclassified_2d = st.checkbox(
-                    "Exclude unclassifiable events from the fixed K = 2 split and continue",
-                    value=False,
-                    key="allow_2d_unclassified_exclusion_v144",
-                )
-
-                if not exclude_unclassified_2d:
-                    export_ready = False
-
-            if (
-                not len(export_short_idx)
-                or not len(export_long_idx)
-            ):
-                st.warning(
-                    "Both fixed-K 2D populations must contain at least one event before export."
-                )
-                export_ready = False
-
+        selected_bic = float(bic["table"].loc[
+            bic["table"]["Components (K)"] == selected_k, "BIC"].iloc[0])
+        delta_bic = selected_bic - float(bic["table"]["BIC"].min())
+        x1, x2, x3 = st.columns(3)
+        x1.metric("BIC-preferred K", str(best_k))
+        x2.metric("Selected K", str(selected_k))
+        x3.metric("ΔBIC from minimum", f"{delta_bic:.1f}")
+        if best_k == max(tested):
+            st.warning("The lowest BIC occurs at the largest K tested. "
+                       "The exact preferred component count is not established; "
+                       "test a wider range if scientifically appropriate.")
+        if selected_k != best_k:
+            st.info("You selected a different K from the BIC minimum. "
+                    "Both values will be recorded in the export.")
+        bic_table = bic["table"].copy()
+        bic_table["Converged"] = [bic["models"][k].converged_ for k in tested]
+        bic_table["EM iterations"] = [bic["models"][k].n_iter_ for k in tested]
+        left, right = st.columns([1.1, 1], gap="large")
+        with left:
+            plot_bic(bic_table, best_k, selected_k)
+        with right:
+            st.markdown("#### Candidate models")
+            st.dataframe(bic_table.style.format(
+                {"BIC": "{:.1f}", "ΔBIC from best": "{:.1f}"}
+            ), hide_index=True, use_container_width=True)
+            if not bic_table["Converged"].all():
+                st.warning("One or more fits did not converge. Treat the affected "
+                           "BIC values cautiously and consider reviewing the fit.")
+        with st.expander("How to interpret BIC"):
+            st.write("BIC balances model likelihood against the number of fitted "
+                     "parameters. Lower BIC is preferred among the candidate models.")
+            st.latex(r"\mathrm{BIC}=-2\ln L+p\ln N")
+            st.caption("A Gaussian component is a statistical description, not "
+                       "automatically a separate DNA transport mechanism.")
     else:
+        st.info("Run the BIC comparison to unlock population analysis and export.")
 
-        export_short_idx = np.array([], dtype=int)
-        export_long_idx = np.array([], dtype=int)
+# Shared selected result — no additional GMM refitting on a K selection.
+fit_state = st.session_state.get("np_fit")
+has_fit = bool(fit_state and fit_state["source"] == source_id)
+if has_fit:
+    bic = fit_state["fit"]
+    chosen_k = int(st.session_state.get("np_selected_k", bic["best_k"]))
+    result = build_bic_selected_population_result(
+        bic, data["dwell_ms"], data["delta_i"], selected_k=chosen_k
+    )
+    cluster_table = descriptive_table(result, data["dwell_ms"], data["delta_i"])
+else:
+    bic = result = cluster_table = None
 
-        if not run_bic_selection or bic_selected_result is None:
-            st.warning(
-                "Run the BIC component-number check above and choose K before "
-                "exporting the selected-K populations."
+# ── POPULATIONS ───────────────────────────────────────────────
+with tabs[2]:
+    st.subheader("Population characterisation")
+    if not has_fit:
+        st.info("Fit the candidate models in Model selection first.")
+    else:
+        st.caption("Clusters are ordered by median original dwell time. Means are "
+                   "calculated from hard-assigned raw events, not GMM centres.")
+        display_cluster_table(cluster_table)
+        st.download_button("Download cluster summary · CSV",
+                           cluster_table.to_csv(index=False),
+                           "cluster_summary.csv", "text/csv")
+        p = result["assignment_probability"]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Median assignment confidence", f"{100*np.median(p):.1f}%")
+        c2.metric("Assignments below 70%", f"{100*np.mean(p < .70):.1f}%")
+        c3.metric("Number of populations", str(result["n_components"]))
+        st.markdown("#### Population map")
+        c1, c2 = st.columns(2)
+        with c1:
+            plot_log = st.toggle("Logarithmic dwell axis", key="cluster_log")
+        with c2:
+            boundary = st.toggle("Show model boundaries", value=True)
+        plot_clusters(data, result, plot_log, boundary)
+        st.markdown("#### Compare distributions")
+        h1, h2, h3 = st.columns(3)
+        with h1:
+            hist_metric = st.selectbox("Variable", ["Dwell time", "ΔI"], key="cluster_metric")
+        with h2:
+            hist_mode = st.selectbox("Y-axis", ["Count", "Density · each cluster",
+                                                "Share of all events"])
+        with h3:
+            n_bins = st.slider("Common bin count", 20, 150, 70, 5)
+        selected_clusters = st.multiselect(
+            "Populations to display",
+            options=list(range(result["n_components"])),
+            default=list(range(result["n_components"])),
+            format_func=lambda k: f"Cluster {k+1}",
+        )
+        if selected_clusters:
+            plot_histogram(data, result, hist_metric, hist_mode, n_bins, selected_clusters)
+        st.caption("All curves use the same bin edges. Density normalizes each "
+                   "population separately; count and share preserve abundance.")
+
+# ── TOPOLOGY ──────────────────────────────────────────────────
+topology_table = None
+effective_counts = None
+topology_threshold = None
+with tabs[3]:
+    st.subheader("Optional segment-topology reclassification")
+    if not has_fit:
+        st.info("Fit a GMM before characterising its clusters.")
+    elif fitting_bytes is None:
+        st.info("Upload the optional event_fitting.npz in the sidebar to enable "
+                "segment and topology analysis. Clustering and other exports remain available.")
+    else:
+        st.caption("Post-clustering sensitivity analysis. The GMM assignments stay "
+                   "fixed while the similarity threshold changes.")
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            enable_topology = st.toggle("Enable reclassification", value=False)
+        with c2:
+            st.caption("Adjacent fitted segment amplitudes are merged when their "
+                       "similarity reaches the selected threshold.")
+        if enable_topology:
+            topology_threshold = st.slider(
+                "Adjacent-segment amplitude similarity threshold (%)",
+                0.0, 100.0, 80.0, 1.0, format="%.0f%%"
             )
-            export_ready = False
-
-        elif bic_selected_result["n_components"] < 2:
-            st.info(
-                "The chosen K = 1 has no multi-population split to export."
-            )
-            export_ready = False
-
-        else:
-            export_cluster_indices = bic_selected_result[
-                "cluster_indices"
-            ]
-
-            export_excluded_idx = np.flatnonzero(
-                ~bic_selected_result["valid"]
-            )
-
-            n_unclassified_bic = int(len(export_excluded_idx))
-
-            if n_unclassified_bic:
-                excluded_fraction = (
-                    100.0 * n_unclassified_bic / n_events
+            st.latex(r"S(a,b)=100\frac{\min(|a|,|b|)}{\max(|a|,|b|)}")
+            st.caption("100% means identical blockade magnitudes. Merged levels are "
+                       "duration-weighted when widths are available. This reproduces "
+                       "the exploratory v1.4.8 rule; it is not a NanoSense-native "
+                       "threshold unless independently verified.")
+            with st.spinner("Reclassifying segment sequences…"):
+                derived = metrics_cached(fitting_bytes, n_total)
+                original_counts = derived["Number of segments"]
+                effective_counts = topology_cached(
+                    fitting_bytes, n_total, topology_threshold
                 )
-
-                st.warning(
-                    f"{n_unclassified_bic:,} of {n_events:,} events "
-                    f"({excluded_fraction:.3f}%) cannot be classified by the "
-                    "selected-K 2D GMM because dwell time and/or ΔI is invalid."
+                topology_table = topology_statistics(
+                    result, original_counts, effective_counts
                 )
+            display_topology_table(topology_table)
+            st.download_button("Download topology summary · CSV",
+                               topology_table.to_csv(index=False),
+                               "topology_summary.csv", "text/csv")
+            plot_topology(topology_table)
+            with st.expander("Definitions and limitations"):
+                st.write("One effective segment is linear-like; two are folded-like; "
+                         "three or more are complex. These are segment-derived, "
+                         "putative classes rather than confirmed molecular conformations.")
+                st.write("Percentages use only events with usable segment information. "
+                         "Missing values are reported separately. Longer events may "
+                         "offer more opportunity for a segmentation algorithm to find "
+                         "multiple levels, so this is supporting evidence, not "
+                         "independent proof of a physical mechanism.")
+                st.write("The similarity rule is applied after the original NanoSense "
+                         "segmentation. It does not refit the current trace or modify "
+                         "the original NPZ files.")
 
-                exclude_unclassified_bic = st.checkbox(
-                    "Exclude unclassifiable events from the selected-K split and continue",
-                    value=False,
-                    key="allow_bic_unclassified_exclusion_v145",
-                )
-
-                if not exclude_unclassified_bic:
-                    export_ready = False
-
-            if any(len(idx) == 0 for idx in export_cluster_indices):
-                st.warning(
-                    "At least one selected-K cluster is empty, so the split cannot be exported."
-                )
-                export_ready = False
-
-            if export_ready:
-                st.caption(
-                    f"Selected-K export will create **{len(export_cluster_indices)} "
-                    "synchronized population folders**, ordered from shortest to "
-                    "longest median dwell time."
-                )
-
-    # Use new version-specific session keys so stale state cannot leak across
-    # deployments or between the two-component and BIC-selected export modes.
-    result_zip_key = "result_zip_v145selectedk"
-    result_name_key = "result_name_v145selectedk"
-    result_message_key = "result_message_v145selectedk"
-
-    if st.button(
-        "Build filtered files",
-        type="primary",
-        disabled=not export_ready,
-    ):
-
-        if export_method == "2D GMM: selected K after BIC":
-
-            n_clusters = len(export_cluster_indices)
-            progress = st.progress(
-                0,
-                text="Building selected-K populations...",
-            )
-
-            bic_cluster_files = []
-            bic_cluster_maps = []
-
-            for cluster_number, cluster_idx in enumerate(
-                export_cluster_indices,
-                start=1,
-            ):
-                cluster_label = f"GMM_CLUSTER_{cluster_number}"
-
-                cluster_files, cluster_map = build_filtered_files(
-                    cluster_idx,
-                    cluster_label,
-                    event_data,
-                    dataset,
-                    event_fitting,
-                )
-
-                bic_cluster_files.append(cluster_files)
-                bic_cluster_maps.append(cluster_map)
-
-                progress.progress(
-                    int(75 * cluster_number / n_clusters),
-                    text=(
-                        f"Built cluster {cluster_number} of {n_clusters}..."
-                    ),
-                )
-
-            progress.progress(
-                85,
-                text="Packing selected-K ZIP...",
-            )
-
-            zip_bytes = make_bic_selected_gmm_zip(
-                stem,
-                gmm2d_delta_i_name,
-                bic_cluster_files,
-                bic_cluster_maps,
-                bic_selected_result["probabilities"],
-                bic_selected_result["median_dwell_ms"],
-                bic2d_result["table"],
-                preferred_k=int(bic2d_result["best_k"]),
-                selected_k=int(bic_selected_result["n_components"]),
-                excluded_idx=export_excluded_idx,
-                dwell_ms=dwell_ms,
-                delta_i=gmm2d_delta_i,
-            )
-
-            result_name = (
-                f"{stem}_2D_GMM_selected_K{n_clusters}_split.zip"
-            )
-
-            count_text = " + ".join(
-                f"**{len(idx):,} Cluster {i + 1}**"
-                for i, idx in enumerate(export_cluster_indices)
-            )
-
-            preferred_k = int(bic2d_result["best_k"])
-            selection_note = (
-                "BIC-preferred"
-                if n_clusters == preferred_k
-                else f"user-selected (BIC preferred K = {preferred_k})"
-            )
-
-            result_message = (
-                f"Ready: {count_text} using **K = {n_clusters}** ({selection_note}) "
-                f"in **log10(dwell time) + {gmm2d_delta_i_name}** space."
-            )
-
-            if len(export_excluded_idx):
-                result_message += (
-                    f" **{len(export_excluded_idx):,} unclassifiable event(s)** "
-                    "were recorded in `excluded_events.csv`."
-                )
-
-        else:
-
-            progress = st.progress(
-                0,
-                text="Building first population...",
-            )
-
-            if export_method == "1D dwell-time split":
-                short_label = "SHORT"
-                long_label = "LONG"
-            else:
-                short_label = "SHORT_2D"
-                long_label = "LONG_2D"
-
-            short_files, short_map = build_filtered_files(
-                export_short_idx,
-                short_label,
-                event_data,
-                dataset,
-                event_fitting,
-            )
-
-            progress.progress(
-                45,
-                text="Building second population...",
-            )
-
-            long_files, long_map = build_filtered_files(
-                export_long_idx,
-                long_label,
-                event_data,
-                dataset,
-                event_fitting,
-            )
-
-            progress.progress(
-                85,
-                text="Packing ZIP...",
-            )
-
-            if export_method == "1D dwell-time split":
-
-                zip_bytes = make_zip(
-                    stem,
-                    cutoff_ms,
-                    short_files,
-                    long_files,
-                    short_map,
-                    long_map,
-                )
-
-                result_name = (
-                    f"{stem}_dwell_split_{cutoff_ms:.4f}ms.zip"
-                )
-
-                result_message = (
-                    f"Ready: **{len(export_short_idx):,} short** + "
-                    f"**{len(export_long_idx):,} long** events using the "
-                    f"**{cutoff_ms:.4f} ms** dwell-time boundary."
-                )
-
-            else:
-
-                zip_bytes = make_2d_gmm_zip(
-                    stem,
-                    gmm2d_delta_i_name,
-                    short_files,
-                    long_files,
-                    short_map,
-                    long_map,
-                    gmm2d_result["p_short"],
-                    gmm2d_result["p_long"],
-                    excluded_idx=export_excluded_idx,
-                    dwell_ms=dwell_ms,
-                    delta_i=gmm2d_delta_i,
-                )
-
-                result_name = (
-                    f"{stem}_2D_GMM_dwell_deltaI_split.zip"
-                )
-
-                result_message = (
-                    f"Ready: **{len(export_short_idx):,} 2D Short-like** + "
-                    f"**{len(export_long_idx):,} 2D Long-like** events using "
-                    f"**log10(dwell time) + {gmm2d_delta_i_name}**."
-                )
-
-                if len(export_excluded_idx):
-                    result_message += (
-                        f" **{len(export_excluded_idx):,} unclassifiable event(s)** "
-                        "were excluded from the two populations and recorded in "
-                        "`excluded_events.csv`."
+# ── EXPORT ────────────────────────────────────────────────────
+with tabs[4]:
+    st.subheader("Export analysis and synchronized populations")
+    if not has_fit:
+        st.info("Run a GMM analysis to enable export.")
+    else:
+        st.caption("All original rows are traceable. Invalid 2D events are logged, "
+                   "and only uploaded source types are included in each cluster folder.")
+        st.markdown("#### Included in the analysis package")
+        st.write("Cluster summary, full event-to-cluster mapping, posterior "
+                 "probabilities, BIC table, model settings, and excluded-event log.")
+        if topology_table is not None:
+            st.write("The current topology reclassification table and threshold "
+                     "will also be included.")
+        sources = ["dataset"]
+        if event_bytes is not None:
+            sources.append("event_data")
+        if fitting_bytes is not None:
+            sources.append("event_fitting")
+        st.markdown("**Available NPZ source types:** " + ", ".join(sources))
+        stem = safe_stem(f_dataset.name)
+        if st.button("Build analysis package", type="primary"):
+            with st.spinner("Building synchronized cluster files…"):
+                try:
+                    zip_bytes = export_bundle(
+                        data, bic, result, topology_table, effective_counts,
+                        topology_threshold, stem
                     )
-
-        progress.progress(
-            100,
-            text="Done",
-        )
-
-        st.session_state[result_zip_key] = zip_bytes
-        st.session_state[result_name_key] = result_name
-        st.session_state[result_message_key] = result_message
-
-    # Only display a result when all state entries exist. This avoids the
-    # stale-session KeyError seen after replacing an older Streamlit app.
-    if all(
-        key in st.session_state
-        for key in (
-            result_zip_key,
-            result_name_key,
-            result_message_key,
-        )
-    ):
-
-        st.success(
-            st.session_state[
-                result_message_key
-            ]
-        )
-
-        st.download_button(
-            "Download filtered populations (.zip)",
-            data=st.session_state[
-                result_zip_key
-            ],
-            file_name=st.session_state[
-                result_name_key
-            ],
-            mime="application/zip",
-        )
-
-
-if __name__ == "__main__":
-    main()
+                    st.session_state["np_export"] = {
+                        "source": source_id,
+                        "K": chosen_k,
+                        "threshold": topology_threshold,
+                        "bytes": zip_bytes
+                    }
+                except Exception as exc:
+                    st.error(f"Export failed: {exc}")
+        export_state = st.session_state.get("np_export")
+        if export_state and export_state["source"] == source_id \
+                and export_state["K"] == chosen_k \
+                and export_state["threshold"] == topology_threshold:
+            st.success("Analysis package is ready.")
+            st.download_button(
+                "Download analysis + clusters · ZIP",
+                export_state["bytes"],
+                file_name=f"{stem}_GMM_K{chosen_k}_analysis.zip",
+                mime="application/zip", type="primary"
+            )
+        elif export_state and export_state["source"] == source_id:
+            st.caption("The selection has changed. Build the package again to "
+                       "include the current K and topology settings.")
+        with st.expander("Export compatibility"):
+            st.write("Dataset-only exports contain filtered dataset.npz files and "
+                     "original-row mapping. If event_data and/or event_fitting were "
+                     "uploaded, their corresponding synchronized, reindexed NPZ files "
+                     "are included too. A complete three-file export retains the "
+                     "original NanoSense source structure.")
+            st.write("The source archives are never overwritten. Original IDs and "
+                     "row indices are retained in event_id_mapping.csv.")
