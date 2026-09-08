@@ -14,10 +14,11 @@ import streamlit as st
 from analysis_core import (
     load_sources, get_feature, select_2d_gmm_components_bic,
     build_bic_selected_population_result, describe, export_results,
+    dataset_column_label, dataset_column_is_current,
 )
 from plotting import (
     bic_plot, scatter_plot, histogram_plot, kde_plot, density_plot,
-    export_bytes, colour,
+    export_bytes, colour, estimate_dwell_resolution_ms, linear_histogram_edges,
 )
 
 st.set_page_config(page_title="Nanopore Analysis", layout="wide",
@@ -117,6 +118,218 @@ def show_figure(fig, stem):
     plt.close(fig)
 
 
+
+
+def render_scientific_plots(data, delta, delta_label, result=None, prefix="data"):
+    """Reference-style figures. All controls are presentation-only."""
+    raw_only = result is None
+    n_events = len(data["dwell_ms"])
+    valid = (np.isfinite(data["dwell_ms"]) & (data["dwell_ms"] > 0)
+             & np.isfinite(delta))
+    if result is None:
+        plot_result = {"valid_idx": np.flatnonzero(valid),
+                       "cluster_indices": [], "labels": np.full(n_events, -1)}
+    else:
+        plot_result = result
+
+    choices = ["Dwell histogram", "Dwell KDE", "ΔI histogram", "ΔI KDE", "2D density"]
+    if not raw_only:
+        choices.insert(0, "GMM classification")
+    kind = st.selectbox("Plot", choices, key=f"{prefix}_plot",
+                        label_visibility="collapsed")
+    plot_key = f"{prefix}_{safe_name(kind)}"
+    is_2d = kind in ("2D density", "GMM classification")
+    is_dwell = "Dwell" in kind or is_2d
+    metric = "Dwell time" if is_dwell and not kind.startswith("ΔI") else "ΔI"
+
+    # The plot can inspect an alternative ΔI source without changing the GMM.
+    plot_delta = delta
+    plot_label = delta_label
+    physical_delta = (delta_label.startswith("ΔI") or "Current drop" in delta_label
+                      or "segment ΔI" in delta_label or "current (nA)" in delta_label)
+    if "ΔI" in kind or is_2d:
+        with st.expander("Plot data", expanded=False):
+            sources = ["GMM feature" if not raw_only else "Current ΔI", "Dataset ΔI"]
+            if data["fitting"] is not None:
+                sources += ["Peak segment ΔI", "Time-weighted segment ΔI"]
+            available = sources[:1] if kind == "GMM classification" else sources
+            plot_source = st.selectbox("Y data", available, key=f"{plot_key}_source")
+            if plot_source == "Dataset ΔI":
+                columns = [j for j in range(data["X"].shape[1]) if j != 4]
+                column = st.selectbox("Dataset column", columns,
+                                     format_func=lambda j: dataset_column_label(j, data["dwell_unit"]),
+                                     key=f"{plot_key}_column")
+                plot_delta, plot_label = get_feature(data, "Dataset ΔI", column)
+                physical_delta = dataset_column_is_current(column)
+            elif plot_source in ("Peak segment ΔI", "Time-weighted segment ΔI"):
+                plot_delta, plot_label = get_feature(data, plot_source)
+                physical_delta = True
+            if physical_delta:
+                units = st.selectbox("Current-drop unit", ["nA", "pA"],
+                                     key=f"{plot_key}_unit")
+            else:
+                units = None
+        scale = 1000.0 if units == "pA" else 1.0
+        if units:
+            plot_label = re.sub(r"\s*\((?:nA|pA)\)$", "", plot_label) + f" ({units})"
+    else:
+        scale = 1.0
+
+    # The raw overview uses the plotted feature's own finite-value mask.
+    # The selected-K view uses only events classified by the fitted model.
+    if raw_only:
+        plot_valid = (np.isfinite(data["dwell_ms"]) & (data["dwell_ms"] > 0)
+                      & np.isfinite(plot_delta))
+        plot_result["valid_idx"] = np.flatnonzero(plot_valid)
+
+    display_data = dict(data, delta_label=plot_label)
+    log_x = st.toggle("Logarithmic dwell-time axis",
+                      value=(kind == "Dwell KDE"),
+                      key=f"{plot_key}_log") if is_dwell else False
+
+    selected = [-1]
+    if result is not None and kind != "GMM classification":
+        if is_2d:
+            selected_one = st.selectbox(
+                "Population", [-1]+list(range(result["n_components"])),
+                format_func=lambda k: "All events" if k == -1 else f"Cluster {k+1}",
+                key=f"{plot_key}_population")
+            selected = [selected_one]
+        else:
+            selected = st.multiselect(
+                "Populations", [-1]+list(range(result["n_components"])),
+                default=list(range(result["n_components"])),
+                format_func=lambda k: "All events" if k == -1 else f"Cluster {k+1}",
+                key=f"{plot_key}_populations")
+            if not selected:
+                st.info("Select at least one population.")
+                return
+
+    figure_title = {
+        "GMM classification": f"Selected-K 2D GMM classification (K = {result['n_components']})"
+                              if result is not None else "GMM classification",
+        "Dwell histogram": "Dwell time distribution",
+        "Dwell KDE": "Dwell time density",
+        "ΔI histogram": "Current-drop distribution",
+        "ΔI KDE": "Current-drop density",
+        "2D density": "Event density",
+    }[kind]
+    xlabel = "Dwell time (ms)" if is_dwell else plot_label
+    ylabel = plot_label if is_2d else (
+        "KDE density in log10(dwell time)" if kind == "Dwell KDE" and log_x else
+        "KDE density" if kind.endswith("KDE") else "Number of events")
+
+    if kind == "GMM classification":
+        c1, c2 = st.columns(2)
+        with c1:
+            boundaries = st.checkbox("Model boundaries", True, key=f"{plot_key}_boundaries")
+        with c2:
+            point_size = st.slider("Point size", 2, 30, 13, key=f"{plot_key}_size")
+        spec = figure_editor(plot_key, figure_title, xlabel, ylabel, log_x)
+        fig = scatter_plot(display_data, result, delta, spec, log_x,
+                           boundaries, point_size, unit_scale=scale)
+        show_figure(fig, plot_key)
+        return
+
+    if kind.endswith("histogram"):
+        mode_options = ["Count", "Density"] if raw_only else [
+            "Count", "Density", "Share of all events"]
+        c1, c2 = st.columns(2)
+        with c1:
+            mode = st.selectbox("Y-axis", mode_options, key=f"{plot_key}_mode")
+        with c2:
+            style = st.selectbox("Style", ["Filled", "Step"], key=f"{plot_key}_style")
+        parent = (data["dwell_ms"] if metric == "Dwell time" else plot_delta*scale)
+        parent = np.asarray(parent)[plot_result["valid_idx"]]
+        parent = parent[np.isfinite(parent) & ((parent > 0) if log_x else True)]
+        if not len(parent):
+            st.info("No valid events are available for this plot.")
+            return
+        control = st.radio("Histogram bin control",
+                           ["Number of bins", "Bin width"],
+                           horizontal=True, key=f"{plot_key}_bin_control")
+        if control == "Number of bins":
+            bins = st.slider("Number of bins", 10, 200, 50, 5,
+                             key=f"{plot_key}_bins")
+            edges = (np.geomspace(np.min(parent), np.max(parent), bins+1)
+                     if log_x else np.histogram_bin_edges(parent, bins=bins))
+        else:
+            default_width = (max(estimate_dwell_resolution_ms(parent), .001)
+                             if metric == "Dwell time"
+                             else max(float(np.ptp(parent))/100., 1e-6))
+            width = st.number_input(
+                f"Bin width ({'ms' if metric == 'Dwell time' else units or 'units'})",
+                min_value=1e-9, value=default_width, step=default_width,
+                format="%.6f", key=f"{plot_key}_width")
+            if log_x:
+                st.caption("Fixed-width bins use a linear X-axis.")
+                log_x = False
+            if float(np.ptp(parent))/width > 10000:
+                st.warning("The selected width creates too many bins. Increase the width.")
+                return
+            if metric == "Dwell time":
+                edges = linear_histogram_edges(parent, width)
+            else:
+                lo, hi = float(np.min(parent)), float(np.max(parent))
+                edges = np.arange(np.floor(lo/width)*width-width/2,
+                                  np.ceil(hi/width)*width+1.5*width, width)
+            if len(edges) > 10001:
+                st.warning("The selected width creates too many bins. Increase the width.")
+                return
+        if len(edges) < 2 or not np.all(np.diff(edges)>0):
+            st.info("The histogram requires a nonzero data range.")
+            return
+        ylabel = {"Count":"Number of events", "Density":"Probability density",
+                  "Share of all events":"Fraction of valid events per bin"}[mode]
+        spec = figure_editor(plot_key, figure_title, xlabel, ylabel, log_x)
+        fig = histogram_plot(display_data, plot_result, plot_delta, metric, selected,
+                             mode, edges, spec, log_x, style, unit_scale=scale)
+        show_figure(fig, plot_key)
+        return
+
+    if kind.endswith("KDE"):
+        bandwidth = st.slider("KDE smoothing", .4, 2., 1., .05,
+                              key=f"{plot_key}_bandwidth")
+        spec = figure_editor(plot_key, figure_title, xlabel, ylabel, log_x)
+        fig = kde_plot(display_data, plot_result, plot_delta, metric, selected,
+                       spec, log_x, bandwidth, unit_scale=scale)
+        show_figure(fig, plot_key)
+        return
+
+    # The original smooth 2D KDE, including its optional dark magma appearance.
+    c1, c2 = st.columns(2)
+    with c1:
+        grid_size = st.slider("Density resolution", 120, 320, 220, 20,
+                              key=f"{plot_key}_resolution")
+        bandwidth = st.slider("KDE smoothing", .4, 2., .90, .05,
+                              key=f"{plot_key}_bandwidth")
+    with c2:
+        cutoff = st.slider("Background cutoff (% of peak density)",
+                           0., 10., .15, .05, key=f"{plot_key}_cutoff")
+        theme = st.selectbox("Density appearance", ["Classic dark", "White"],
+                             key=f"{plot_key}_theme")
+    with st.expander("Display filter"):
+        percentiles = st.slider("Displayed Y percentile range", 0., 100.,
+                                (0.,100.), .5, key=f"{plot_key}_percentiles")
+    spec = figure_editor(plot_key, figure_title, "Dwell time (ms)",
+                         plot_label, log_x)
+    indices = (plot_result["valid_idx"] if selected == [-1]
+               else plot_result["cluster_indices"][selected[0]])
+    try:
+        fig, details = density_plot(
+            display_data, plot_delta, spec, log_x, bandwidth,
+            selected_indices=indices, grid_size=grid_size,
+            cutoff_percent=cutoff, y_percentiles=percentiles,
+            unit_scale=scale, theme=theme, return_details=True)
+        show_figure(fig, plot_key)
+        if details["selected_events"] > details["kde_events"]:
+            st.caption(f"KDE evaluated using {details['kde_events']:,} of "
+                       f"{details['selected_events']:,} selected events. "
+                       "Sampling and display filters do not change GMM assignments.")
+    except Exception as exc:
+        st.warning(f"Density calculation unavailable: {exc}")
+
+
 st.title("Nanopore Analysis")
 
 with st.sidebar:
@@ -132,8 +345,7 @@ with st.sidebar:
     st.divider()
     st.markdown("### GMM settings")
     max_k = st.slider("Maximum K", 2, 10, 6)
-    st.caption("Full covariance · 10 initializations · random seed 0")
-    st.caption("v2.1 · Scientific edition")
+    st.caption("v2.2 · Scientific edition")
 
 if uploaded_dataset is None:
     st.info("Upload a dataset.npz file to begin.")
@@ -158,15 +370,14 @@ with st.sidebar:
     if feature_source == "Dataset ΔI":
         columns = [j for j in range(data["X"].shape[1]) if j != 4]
         feature_column = st.selectbox("Dataset column", columns,
-                                      format_func=lambda j: "X[:,0] · ΔI" if j == 0
-                                      else f"X[:,{j}]")
+                                      format_func=lambda j: dataset_column_label(j, dwell_unit))
     try:
         delta, delta_label = get_feature(data, feature_source, feature_column)
     except Exception as exc:
         st.error(str(exc))
         st.stop()
     if feature_source == "Dataset ΔI" and feature_column != 0:
-        st.caption("Verify the physical units of the selected column.")
+        st.caption("Select a blockade-related feature for the intended GMM analysis.")
 
 data["delta_label"] = delta_label
 valid_mask = (np.isfinite(data["dwell_ms"]) & (data["dwell_ms"] > 0) &
@@ -230,41 +441,7 @@ tab_data, tab_model, tab_export = st.tabs(["Data", "BIC & populations", "Export"
 
 with tab_data:
     st.subheader("Data overview")
-    plot_type = st.selectbox("Plot", ["Dwell distribution", "ΔI distribution", "2D density"],
-                             key="overview_type", label_visibility="collapsed")
-    log_x = st.checkbox("Logarithmic dwell axis", value=True,
-                        key="overview_log") if plot_type != "ΔI distribution" else False
-    if plot_type == "2D density":
-        bandwidth = st.slider("KDE bandwidth", .5, 2., 1., .1, key="overview_bw")
-        spec = figure_editor("overview_2d", "Event density",
-                             "Dwell time (ms)", delta_label, log_x)
-        if n_valid >= 5:
-            try:
-                fig = density_plot(data, delta, spec, log_x, bandwidth)
-                show_figure(fig, "event_density")
-            except Exception as exc:
-                st.warning(f"Density calculation unavailable: {exc}")
-    else:
-        metric = "Dwell time" if plot_type == "Dwell distribution" else "ΔI"
-        values = data["dwell_ms"][valid_mask] if metric == "Dwell time" else delta[valid_mask]
-        mode = st.selectbox("Y-axis", ["Count", "Density"], key="overview_mode")
-        bins = st.slider("Number of bins", 10, 200, 70, 5, key="overview_bins")
-        if len(values):
-            edges = np.histogram_bin_edges(
-                np.log10(values) if log_x else values, bins=bins
-            )
-            if log_x:
-                edges = 10**edges
-            spec = figure_editor("overview_hist", plot_type,
-                                 "Dwell time (ms)" if metric == "Dwell time" else delta_label,
-                                 "Number of events" if mode == "Count" else "Probability density",
-                                 log_x)
-            # Use the original valid parent population, not an arbitrary cutoff.
-            overview_result = {"valid_idx": np.flatnonzero(valid_mask),
-                               "cluster_indices": [], "labels": np.full(n_total, -1)}
-            fig = histogram_plot(data, overview_result, delta, metric, [-1], mode,
-                                 edges, spec, log_x)
-            show_figure(fig, "data_distribution")
+    render_scientific_plots(data, delta, delta_label, prefix="data")
     with st.expander("Data validation"):
         st.write(f"Dataset shape: {data['X'].shape}")
         st.write(f"Feature: {delta_label}; dwell input unit: {dwell_unit}.")
@@ -321,106 +498,8 @@ with tab_model:
                            "cluster_summary.csv", "text/csv")
         st.divider()
         st.subheader("Population plots")
-        plot_kind = st.selectbox("Plot", [
-            "GMM classification", "Dwell distribution", "ΔI distribution",
-            "Dwell KDE", "ΔI KDE", "2D density"
-        ], key="population_plot", label_visibility="collapsed")
-        is_dwell = "Dwell" in plot_kind or plot_kind in ("GMM classification", "2D density")
-        log_plot = st.checkbox("Logarithmic dwell axis", True,
-                               key="population_log") if is_dwell else False
-        selection = []
-        if plot_kind not in ("GMM classification", "2D density"):
-            choices = [-1] + list(range(result["n_components"]))
-            selection = st.multiselect(
-                "Populations", choices, default=list(range(result["n_components"])),
-                format_func=lambda k: "All events" if k == -1 else f"Cluster {k+1}",
-                key="population_selection"
-            )
-        if plot_kind == "GMM classification":
-            c1, c2 = st.columns(2)
-            with c1:
-                boundary = st.checkbox("Model boundaries", True)
-            with c2:
-                point_size = st.slider("Point size", 2, 25, 8)
-            spec = figure_editor("classification", "GMM population classification",
-                                 "Dwell time (ms)", delta_label, log_plot)
-            fig = scatter_plot(data, result, delta, spec, log_plot, boundary, point_size)
-            show_figure(fig, "gmm_classification")
-        elif plot_kind == "2D density":
-            bw = st.slider("KDE bandwidth", .5, 2., 1., .1, key="population_bw")
-            spec = figure_editor("population_density", "Event density",
-                                 "Dwell time (ms)", delta_label, log_plot)
-            try:
-                fig = density_plot(data, delta, spec, log_plot, bw)
-                show_figure(fig, "population_density")
-            except Exception as exc:
-                st.warning(f"Density calculation unavailable: {exc}")
-        elif selection:
-            metric = "Dwell time" if "Dwell" in plot_kind else "ΔI"
-            xlabel = "Dwell time (ms)" if metric == "Dwell time" else delta_label
-            if "KDE" in plot_kind:
-                bw = st.slider("KDE bandwidth", .5, 2., 1., .1, key="cluster_bw")
-                spec = figure_editor("cluster_kde", f"{metric} density",
-                                     xlabel, "Probability density", log_plot)
-                fig = kde_plot(data, result, delta, metric, selection, spec, log_plot, bw)
-            else:
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    mode = st.selectbox("Y-axis", ["Count", "Density", "Share of all events"],
-                                        key="cluster_hist_mode")
-                with c2:
-                    bins = st.slider("Bins", 10, 250, 70, 5, key="cluster_bins")
-                with c3:
-                    style = st.selectbox("Style", ["Step", "Filled"], key="hist_style")
-                with st.expander("Bin and range controls"):
-                    bin_method = st.selectbox("Bin spacing", ["Automatic", "Fixed width"],
-                                              key="bin_method")
-                    manual_width = None
-                    if bin_method == "Fixed width":
-                        manual_width = st.number_input("Bin width (original units)",
-                                                       min_value=1e-9, value=.005,
-                                                       format="%.6f")
-                    trim = st.checkbox("Set histogram range", False)
-                    lower = upper = None
-                    if trim:
-                        lower = st.number_input("Range minimum", value=0., format="%.6f")
-                        upper = st.number_input("Range maximum", value=1., format="%.6f")
-                parent = data["dwell_ms"] if metric == "Dwell time" else delta
-                parent = parent[result["valid_idx"]]
-                parent = parent[np.isfinite(parent) & ((parent > 0) if log_plot else True)]
-                if len(parent):
-                    lo, hi = float(np.min(parent)), float(np.max(parent))
-                    if trim:
-                        if lower >= upper or (log_plot and lower <= 0):
-                            st.warning("Invalid histogram range; using the full range.")
-                        else:
-                            lo, hi = float(lower), float(upper)
-                    if hi <= lo:
-                        hi = lo + max(abs(lo)*1e-6, 1e-9)
-                    if manual_width:
-                        if (hi-lo)/manual_width > 10000:
-                            st.warning("Too many bins; increase the width or narrow the range.")
-                            manual_width = (hi-lo)/10000
-                        edges = np.arange(lo, hi+manual_width, manual_width)
-                        if len(edges) < 2:
-                            edges = np.array([lo, hi])
-                    elif log_plot:
-                        edges = np.geomspace(lo, hi, bins+1)
-                    else:
-                        edges = np.linspace(lo, hi, bins+1)
-                    ylabel = {"Count":"Number of events", "Density":"Probability density",
-                              "Share of all events":"Fraction of valid events per bin"}[mode]
-                    spec = figure_editor("cluster_hist", f"{metric} distribution",
-                                         xlabel, ylabel, log_plot)
-                    fig = histogram_plot(data, result, delta, metric, selection,
-                                         mode, edges, spec, log_plot, style)
-                else:
-                    fig = None
-            if fig is not None:
-                show_figure(fig, safe_name(plot_kind.lower().replace(" ", "_")))
-        if plot_kind not in ("GMM classification", "2D density"):
-            st.caption("Common bin edges are used across populations. Density normalizes "
-                       "each cluster separately; counts and event shares preserve abundance.")
+        render_scientific_plots(data, delta, delta_label, result=result,
+                                prefix="population")
 
 with tab_export:
     st.subheader("Export")

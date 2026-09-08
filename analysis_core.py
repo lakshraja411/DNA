@@ -378,6 +378,30 @@ def build_bic_selected_population_result(
     }
 
 
+
+DATASET_COLUMN_LABELS = {
+    0: "Current drop, ΔI (nA)",
+    1: "Full width at half maximum, FWHM (s)",
+    2: "Blockade height at FWHM (nA)",
+    3: "Event area (stored units)",
+    4: "Dwell time (s)",
+    5: "Skewness",
+    6: "Kurtosis",
+    7: "Baseline current (nA)",
+    8: "Event time (s)",
+}
+
+def dataset_column_label(index, dwell_unit="s"):
+    """Human-readable labels for the current NanoSense X-array layout."""
+    index = int(index)
+    if index == 4:
+        return f"Dwell time ({dwell_unit})"
+    return DATASET_COLUMN_LABELS.get(index, f"Dataset column {index + 1} (unlabelled)")
+
+def dataset_column_is_current(index):
+    return int(index) in (0, 2, 7)
+
+
 def _to_bytes(arrays):
     buf = io.BytesIO()
     np.savez_compressed(buf, **arrays)
@@ -437,7 +461,7 @@ def get_feature(data, source="Dataset ΔI", column=0):
         if column == 4:
             raise ValueError("The dwell-time column cannot be used as ΔI.")
         return np.asarray(data["X"][:, column], dtype=float), (
-            "ΔI (nA)" if column == 0 else f"X[:, {column}]"
+            dataset_column_label(column, data["dwell_unit"])
         )
     if data["fitting"] is None:
         raise ValueError("event_fitting is required for segment-derived ΔI.")

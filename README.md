@@ -1,61 +1,29 @@
-# Nanopore Analysis — Scientific edition
+# Nanopore Analysis — Scientific edition v2.2
 
-A compact, white scientific interface for the existing BIC-guided nanopore GMM workflow.
+## Run
+Install requirements.txt, then run `streamlit run app.py`.
+For Streamlit Community Cloud, upload the project files and set the main file to app.py.
 
-## Install and run
+## Changes in v2.2
+- Restored the plotting behaviour from app(20260908-040321).py: filled overlapping histograms, original Silverman KDE, original smooth 2D KDE, masked magma density, and selected-K scatter boundaries.
+- The density plot offers Classic dark and White appearances. Other figures retain the white scientific style.
+- The figure editor still allows custom titles, axis labels, font sizes, dimensions, legends and limits. PNG, PDF and SVG exports remain available.
+- Removed the visible covariance/initialization/random-seed caption; fitting settings are unchanged.
+- Replaced raw dataset column indices with descriptive names in the selectors and plot labels.
 
-Install the packages in requirements.txt, then run:
+## Dataset columns
+The current NanoSense layout is:
+0 Current drop, ΔI (nA)
+1 Full width at half maximum, FWHM (s)
+2 Blockade height at FWHM (nA)
+3 Event area (stored units; confirm the area convention in the source)
+4 Dwell time (s)
+5 Skewness
+6 Kurtosis
+7 Baseline current (nA)
+8 Event time (s)
 
-    streamlit run app.py
-
-For Streamlit Community Cloud, upload app.py, analysis_core.py, plotting.py,
-splitter_core.py, requirements.txt, and .streamlit/config.toml. Set the main
-file path to app.py. Keep your previous deployment as a backup until the new
-version has been checked with your real measurements.
+Unknown extra columns are labelled as unlabelled dataset columns rather than assigned an invented physical meaning. The original X-array indices and values are not changed.
 
 ## Analysis
-
-Only dataset.npz is required. The default mapping is X[:,0] = ΔI (nA) and
-X[:,4] = dwell time (seconds). Select the correct dwell unit and ΔI source.
-event_data.npz and event_fitting.npz are optional. When supplied, they are
-checked against the dataset before analysis.
-
-The original BIC GMM algorithm is preserved: standardized [log10(dwell_ms), ΔI],
-full covariance, 10 initializations, random_state=0, reg_covar=1e-6.
-Models are compared for K=1 through the selected maximum; any tested K can be
-chosen. No separate 1D or forced-K2 analysis is run.
-
-The population table reports arithmetic means and medians of original
-hard-assigned events, not transformed Gaussian centres. Clusters are ordered
-by median original dwell. The optional companion files are not required for
-basic clustering or dataset-only exports.
-
-## Figures
-
-All figures use white backgrounds, black axes, restrained colours, and
-Matplotlib. Open Figure settings to edit the title, axis labels, size, font,
-legend, grid, and axis limits. Export each figure as PNG (600 dpi), PDF, or
-SVG. Figure settings do not change the model, event assignments, or statistics.
-Raw and selected-population histograms, KDE curves, 2D density, GMM
-classification, and BIC plotting are available. Histogram count, density,
-share, bin width, and logarithmic-axis controls are explicit.
-
-## Exports
-
-The ZIP contains cluster summary, BIC results, all original-row assignments,
-posterior probabilities, settings, an excluded-event log, and filtered NPZ
-files for each cluster. When all three source files are supplied, the original
-synchronized export routine is used. Dataset-only exports contain dataset
-files and row mappings. Source files are never overwritten.
-
-## Notes
-
-Gaussian components are statistical descriptions, not confirmed molecular
-transport mechanisms. A BIC minimum at the largest K tested may require a
-wider candidate range. Event-level uncertainty is not a substitute for
-replicate-level uncertainty. KDE smoothing and display sampling affect only
-the figure.
-
-Only open trusted NPZ archives because NanoSense object arrays require pickle
-loading. This app does not make external analysis requests, but files uploaded
-to a hosted Streamlit app are processed on that hosting service.
+The existing BIC-guided 2D GMM and selected-K workflow is preserved. There is no separate 1D cutoff, forced-K2 or topology section. Dataset is required; event data and event fitting are optional. Complete three-file inputs can be exported as synchronized, reindexed NPZ populations. Keep your previous deployment as a backup until you have checked this release with real data.
