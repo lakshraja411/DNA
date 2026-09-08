@@ -1,683 +1,454 @@
-"""Nanopore Studio — BIC-guided event population analysis."""
+"""Nanopore Analysis — a compact, scientific GMM analysis workspace."""
 from __future__ import annotations
 
 import hashlib
 import io
 import re
+import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-from scipy.stats import gaussian_kde
 
-from nanopore_engine import (
-    build_bic_selected_population_result,
-    descriptive_table,
-    derive_event_metrics,
-    event_assignment_table,
-    export_bundle,
-    read_sources,
-    reclassify_segment_counts_by_similarity,
-    select_2d_gmm_components_bic,
-    topology_statistics,
+from analysis_core import (
+    load_sources, get_feature, select_2d_gmm_components_bic,
+    build_bic_selected_population_result, describe, export_results,
 )
-from splitter_core import clean_stem
-
-VERSION = "2.0.0"
-COLORS = [
-    "#3CB8AE", "#E9A55D", "#8B8BEA", "#5D9FE6", "#E27586",
-    "#83B966", "#C78CCC", "#D5BD65", "#67B9D5", "#AD9F93",
-]
-
-st.set_page_config(
-    page_title="Nanopore Studio",
-    page_icon="🧬",
-    layout="wide",
-    initial_sidebar_state="expanded",
+from plotting import (
+    bic_plot, scatter_plot, histogram_plot, kde_plot, density_plot,
+    export_bytes, colour,
 )
+
+st.set_page_config(page_title="Nanopore Analysis", layout="wide",
+                   initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
-:root { color-scheme: dark; }
-.block-container { max-width: 1480px; padding-top: 1.65rem; padding-bottom: 3rem; }
-[data-testid="stSidebar"] { border-right: 1px solid #263748; }
-h1, h2, h3 { letter-spacing: -.025em; }
-.stTabs [data-baseweb="tab-list"] { gap: .45rem; border-bottom: 1px solid #2A3B4C; }
-.stTabs [data-baseweb="tab"] { border-radius: 8px 8px 0 0; padding: .6rem 1rem; }
+.block-container {max-width: 1380px; padding-top: 1.45rem; padding-bottom: 3rem;}
+h1 {font-size: 1.85rem !important; letter-spacing: -.025em; font-weight: 600;}
+h2 {font-size: 1.22rem !important; font-weight: 600; margin-top: .5rem;}
+h3 {font-size: 1.02rem !important; font-weight: 600;}
+[data-testid="stSidebar"] {border-right: 1px solid #E1E5E9;}
+[data-testid="stMetric"] {border: 0; padding: .2rem 0;}
+[data-testid="stMetricLabel"] {font-size: .82rem;}
+[data-testid="stMetricValue"] {font-size: 1.45rem;}
+div[data-baseweb="tab-list"] {gap: 1rem; border-bottom: 1px solid #DCE2E7;}
+div[data-baseweb="tab"] {padding: .55rem .15rem; font-size: .92rem;}
 .stButton button[kind="primary"], .stDownloadButton button[kind="primary"] {
-    background: #287F7B; border: 1px solid #3A9994; color: white;
-}
-.stButton button[kind="primary"]:hover, .stDownloadButton button[kind="primary"]:hover {
-    background: #32918B; color: white;
-}
-.np-eyebrow { color: #80BDB7; font-size: .72rem; font-weight: 700;
-    letter-spacing: .13em; text-transform: uppercase; margin-bottom: .4rem; }
-.np-subtitle { color: #AABBC9; font-size: 1rem; line-height: 1.65; max-width: 780px; }
-.np-rule { height: 1px; background: #27394A; margin: 1.2rem 0; }
-.np-note { background: #172B3A; border: 1px solid #2C4556;
-    border-radius: 10px; padding: .8rem 1rem; color: #C4D4DE; font-size: .89rem; }
-.np-kicker { color: #92A9BA; font-size: .78rem; letter-spacing: .035em; }
+ background: #286B75; border-color: #286B75; color: white;}
+.stButton button[kind="primary"]:hover {background: #1E5660; color: white;}
+[data-testid="stAlert"] {border-radius: 5px;}
+hr {border-color: #E4E8EB;}
 </style>
 """, unsafe_allow_html=True)
 
 
 @st.cache_data(show_spinner=False)
-def load_cached(dataset_bytes, event_bytes, fitting_bytes, unit):
-    return read_sources(dataset_bytes, event_bytes, fitting_bytes, unit)
+def cached_load(dataset_bytes, event_bytes, fitting_bytes, dwell_unit):
+    return load_sources(dataset_bytes, event_bytes, fitting_bytes, dwell_unit)
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
-def fit_cached(dwell_ms, delta_i, max_k):
-    return select_2d_gmm_components_bic(
-        dwell_ms, delta_i, max_components=max_k
-    )
+@st.cache_resource(show_spinner=False, max_entries=4)
+def cached_fit(dwell, delta, max_k):
+    return select_2d_gmm_components_bic(dwell, delta, max_k)
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
-def topology_cached(fitting_bytes, n_events, threshold):
-    from splitter_core import load_npz_bytes
-    fitting = load_npz_bytes(fitting_bytes)
-    return reclassify_segment_counts_by_similarity(
-        fitting, n_events, threshold
-    )
+def safe_name(text):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._") or "analysis"
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
-def metrics_cached(fitting_bytes, n_events):
-    from splitter_core import load_npz_bytes
-    return derive_event_metrics(load_npz_bytes(fitting_bytes), n_events)
+def figure_editor(key, default_title, xlabel, ylabel, log_x=False, can_log=True):
+    """Editable presentation parameters. No plotting option changes the fit."""
+    with st.expander("Figure settings", expanded=False):
+        title = st.text_input("Title", default_title, key=f"{key}_title")
+        c1, c2 = st.columns(2)
+        with c1:
+            xlab = st.text_input("X-axis label", xlabel, key=f"{key}_xlabel")
+            width = st.number_input("Width (inches)", 4., 14., 7.6, .2,
+                                    key=f"{key}_width")
+        with c2:
+            ylab = st.text_input("Y-axis label", ylabel, key=f"{key}_ylabel")
+            height = st.number_input("Height (inches)", 3., 10., 5., .2,
+                                     key=f"{key}_height")
+        font = st.slider("Font size (pt)", 8, 18, 11, key=f"{key}_font")
+        grid, legend = st.columns(2)
+        with grid:
+            show_grid = st.checkbox("Subtle Y grid", False, key=f"{key}_grid")
+        with legend:
+            show_legend = st.checkbox("Legend", True, key=f"{key}_legend")
+        use_limits = st.checkbox("Set axis limits", False, key=f"{key}_limits")
+        xmin = xmax = ymin = ymax = None
+        if use_limits:
+            l1, l2 = st.columns(2)
+            with l1:
+                xmin_text = st.text_input("X minimum", key=f"{key}_xmin")
+                ymin_text = st.text_input("Y minimum", key=f"{key}_ymin")
+            with l2:
+                xmax_text = st.text_input("X maximum", key=f"{key}_xmax")
+                ymax_text = st.text_input("Y maximum", key=f"{key}_ymax")
+            try:
+                xmin = float(xmin_text) if xmin_text.strip() else None
+                xmax = float(xmax_text) if xmax_text.strip() else None
+                ymin = float(ymin_text) if ymin_text.strip() else None
+                ymax = float(ymax_text) if ymax_text.strip() else None
+            except ValueError:
+                st.warning("Axis limits must be numeric. Invalid limits were ignored.")
+                xmin = xmax = ymin = ymax = None
+            if log_x and xmin is not None and xmin <= 0:
+                st.warning("A logarithmic X-axis requires a positive minimum.")
+                xmin = None
+    return dict(title=title, xlabel=xlab, ylabel=ylab, width=width,
+                height=height, font_size=font, grid=show_grid,
+                legend=show_legend, xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)
 
 
-def fmt(value, digits=3):
-    return f"{value:,.{digits}f}" if np.isfinite(value) else "—"
-
-
-def style_figure(fig, ax):
-    fig.patch.set_facecolor("#101D2B")
-    ax.set_facecolor("#101D2B")
-    for spine in ax.spines.values():
-        spine.set_color("#3D5062")
-    ax.tick_params(colors="#B9C9D5", labelsize=9)
-    ax.xaxis.label.set_color("#CEDAE3")
-    ax.yaxis.label.set_color("#CEDAE3")
-    ax.title.set_color("#F0F5F8")
-    ax.grid(False)
-    return fig, ax
-
-
-def new_figure(figsize=(8.8, 5)):
-    fig, ax = plt.subplots(figsize=figsize, dpi=120)
-    return style_figure(fig, ax)
-
-
-def render_figure(fig, filename=None):
-    st.pyplot(fig, clear_figure=False, use_container_width=True)
-    if filename:
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=300, bbox_inches="tight",
-                    facecolor=fig.get_facecolor())
-        st.download_button("Download figure · PNG", buf.getvalue(),
-                           file_name=filename, mime="image/png")
+def show_figure(fig, stem):
+    st.pyplot(fig, use_container_width=True)
+    c1, c2, c3 = st.columns([1, 1, 1])
+    for column, fmt, mime in zip(
+        (c1, c2, c3), ("png", "pdf", "svg"),
+        ("image/png", "application/pdf", "image/svg+xml")
+    ):
+        with column:
+            st.download_button(fmt.upper(), export_bytes(fig, fmt),
+                               f"{stem}.{fmt}", mime=mime,
+                               use_container_width=True, key=f"download_{stem}_{fmt}")
     plt.close(fig)
 
 
-def colour(index):
-    return COLORS[index % len(COLORS)]
-
-
-def raw_density(dwell, delta, log_x=False, smooth=1.0):
-    """Smooth KDE is visual-only; bounded sample and grid protect Cloud memory."""
-    valid = np.isfinite(dwell) & (dwell > 0) & np.isfinite(delta)
-    x, y = dwell[valid], delta[valid]
-    if len(x) < 5:
-        return None
-    if len(x) > 3500:
-        rng = np.random.default_rng(0)
-        chosen = rng.choice(len(x), 3500, replace=False)
-        x, y = x[chosen], y[chosen]
-    work = np.log10(x) if log_x else x
-    if np.ptp(work) <= 0 or np.ptp(y) <= 0:
-        return None
-    lo_x, hi_x = np.percentile(work, [0.2, 99.8])
-    lo_y, hi_y = np.percentile(y, [0.2, 99.8])
-    keep = (work >= lo_x) & (work <= hi_x) & (y >= lo_y) & (y <= hi_y)
-    work, y = work[keep], y[keep]
-    if len(work) < 5:
-        return None
-    try:
-        kde = gaussian_kde(np.vstack([work, y]), bw_method="scott")
-        kde.set_bandwidth(kde.factor * smooth)
-        gx = np.linspace(lo_x, hi_x, 150)
-        gy = np.linspace(lo_y, hi_y, 150)
-        xx, yy = np.meshgrid(gx, gy)
-        zz = kde(np.vstack([xx.ravel(), yy.ravel()])).reshape(xx.shape)
-    except (ValueError, np.linalg.LinAlgError):
-        return None
-    return (10**gx if log_x else gx), gy, zz, len(work)
-
-
-def plot_density(dwell, delta, log_x=False, smooth=1.0):
-    density = raw_density(dwell, delta, log_x, smooth)
-    if density is None:
-        st.info("A smooth KDE could not be calculated for these values.")
-        return
-    gx, gy, zz, n_plot = density
-    fig, ax = new_figure()
-    mesh = ax.pcolormesh(gx, gy, zz, shading="auto", cmap="magma")
-    if log_x:
-        ax.set_xscale("log")
-    ax.set_xlabel("Dwell time (ms)")
-    ax.set_ylabel("ΔI (nA)")
-    ax.set_title("Event density")
-    cbar = fig.colorbar(mesh, ax=ax, pad=.025)
-    cbar.set_label("KDE density", color="#CEDAE3")
-    cbar.ax.tick_params(colors="#B9C9D5")
-    fig.tight_layout()
-    render_figure(fig, "event_density.png")
-    st.caption(f"KDE fitted to {n_plot:,} events. A reproducible sample is used "
-               "above 3,500 events. Smoothing and display limits do not alter clustering.")
-
-
-def plot_bic(table, best_k, selected_k):
-    fig, ax = new_figure((8.5, 4.1))
-    x = table["Components (K)"].to_numpy()
-    y = table["BIC"].to_numpy()
-    ax.plot(x, y, color="#75A9B8", lw=2, marker="o", ms=5)
-    ax.scatter([best_k], [float(np.min(y))], s=105, color="#3CB8AE",
-               zorder=5, label=f"Minimum BIC · K={best_k}")
-    if selected_k != best_k:
-        val = float(table.loc[table["Components (K)"] == selected_k, "BIC"].iloc[0])
-        ax.scatter([selected_k], [val], s=100, marker="D",
-                   color="#E9A55D", zorder=6, label=f"Selected · K={selected_k}")
-    ax.set_xticks(x)
-    ax.set_xlabel("Number of Gaussian components (K)")
-    ax.set_ylabel("BIC")
-    ax.set_title("Model selection")
-    ax.legend(frameon=False, labelcolor="#D3DEE7", fontsize=9)
-    fig.tight_layout()
-    render_figure(fig, "bic_model_selection.png")
-
-
-def plot_clusters(data, result, log_x=False, show_boundary=True):
-    idx = result["valid_idx"]
-    dwell = data["dwell_ms"]
-    delta = data["delta_i"]
-    labels = result["labels"]
-    fig, ax = new_figure((9.0, 5.7))
-    # Plot-only sampling, identical assignments and model are retained.
-    if len(idx) > 20000:
-        idx = np.sort(np.random.default_rng(0).choice(idx, 20000, replace=False))
-    if show_boundary and result["n_components"] > 1:
-        scaler, model = result["scaler"], result["model"]
-        log_d = np.log10(dwell[result["valid_idx"]])
-        amp = delta[result["valid_idx"]]
-        gx = np.linspace(np.percentile(log_d, .2), np.percentile(log_d, 99.8), 170)
-        gy = np.linspace(np.percentile(amp, .2), np.percentile(amp, 99.8), 145)
-        xx, yy = np.meshgrid(gx, gy)
-        features = np.column_stack([xx.ravel(), yy.ravel()])
-        pred = model.predict(scaler.transform(features))
-        ordered = result["raw_to_ordered"][pred].reshape(xx.shape)
-        ax.contour(10**xx, yy, ordered, levels=np.arange(result["n_components"]-1)+.5,
-                   colors="#8495A5", linewidths=.8, alpha=.55)
-    for k, indices in enumerate(result["cluster_indices"]):
-        selected = idx[labels[idx] == k]
-        ax.scatter(dwell[selected], delta[selected], s=8, alpha=.47,
-                   color=colour(k), edgecolors="none",
-                   label=f"C{k+1} · {len(indices):,}")
-    if log_x:
-        ax.set_xscale("log")
-    ax.set_xlabel("Dwell time (ms)")
-    ax.set_ylabel("ΔI (nA)")
-    ax.set_title("Selected-K population map")
-    ax.legend(frameon=False, labelcolor="#D3DEE7", fontsize=8,
-              loc="best", ncol=2, markerscale=2)
-    fig.tight_layout()
-    render_figure(fig, "gmm_population_map.png")
-
-
-def plot_histogram(data, result, metric, mode, bins, selected_clusters):
-    values = data["dwell_ms"] if metric == "Dwell time" else data["delta_i"]
-    arrays = [values[result["cluster_indices"][k]] for k in selected_clusters]
-    arrays = [a[np.isfinite(a)] for a in arrays]
-    nonempty = [a for a in arrays if len(a)]
-    if not nonempty:
-        st.info("No events are available for this histogram.")
-        return
-    all_values = values[result["valid_idx"]]
-    all_values = all_values[np.isfinite(all_values)]
-    low, high = np.min(all_values), np.max(all_values)
-    if low == high:
-        high = low + 1e-9
-    edges = np.linspace(low, high, bins + 1)
-    fig, ax = new_figure()
-    for k, arr in zip(selected_clusters, arrays):
-        if not len(arr):
-            continue
-        weights = None
-        density = mode == "Density · each cluster"
-        if mode == "Share of all events":
-            weights = np.full(len(arr), 1.0 / len(result["valid_idx"]))
-        ax.hist(arr, bins=edges, weights=weights, density=density,
-                histtype="step", linewidth=1.7, color=colour(k),
-                label=f"C{k+1} · {len(arr):,}")
-    ax.set_xlabel("Dwell time (ms)" if metric == "Dwell time" else "ΔI (nA)")
-    ax.set_ylabel({
-        "Count": "Number of events",
-        "Density · each cluster": "Probability density",
-        "Share of all events": "Fraction of all valid events / bin",
-    }[mode])
-    ax.set_title(f"{metric} distributions")
-    ax.legend(frameon=False, labelcolor="#D3DEE7", fontsize=9)
-    fig.tight_layout()
-    render_figure(fig, "cluster_distributions.png")
-
-
-def display_cluster_table(table):
-    st.dataframe(
-        table.style.format({
-            "% of valid events": "{:.1f}",
-            "Median dwell (ms)": "{:.4f}",
-            "Mean dwell (ms)": "{:.4f}",
-            "Mean ΔI (nA)": "{:.4f}",
-        }),
-        hide_index=True, use_container_width=True
-    )
-
-
-def display_topology_table(table):
-    st.dataframe(table.style.format({
-        "Mean original segments": "{:.3f}",
-        "Mean reclassified segments": "{:.3f}",
-        "% linear": "{:.1f}", "% folded": "{:.1f}", "% complex": "{:.1f}",
-    }), hide_index=True, use_container_width=True)
-
-
-def plot_topology(table):
-    fig, ax = new_figure((9, 4.8))
-    x = np.arange(len(table))
-    width = .25
-    labels = ["Linear-like", "Folded-like", "Complex"]
-    columns = ["% linear", "% folded", "% complex"]
-    colours = ["#3CB8AE", "#E9A55D", "#8B8BEA"]
-    for i, (name, column, c) in enumerate(zip(labels, columns, colours)):
-        vals = table[column].fillna(0).to_numpy()
-        ax.bar(x + (i-1)*width, vals, width=.24, color=c, label=name)
-    ax.set_xticks(x)
-    ax.set_xticklabels(table["Cluster"])
-    ax.set_ylabel("Events with usable topology (%)")
-    ax.set_ylim(0, 105)
-    ax.set_title("Segment-derived event classes")
-    ax.legend(frameon=False, labelcolor="#D3DEE7", ncol=3, fontsize=9)
-    fig.tight_layout()
-    render_figure(fig, "topology_by_cluster.png")
-
-
-def safe_stem(filename):
-    stem = clean_stem(filename)
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._") or "nanopore"
-
-
-# ─────────────────────────────────────────────────────────────
-# APPLICATION
-# ─────────────────────────────────────────────────────────────
-
-st.markdown('<div class="np-eyebrow">Research analysis workspace</div>',
-            unsafe_allow_html=True)
-st.title("Nanopore Studio")
-st.markdown(
-    '<div class="np-subtitle">Explore event distributions, select Gaussian '
-    'mixture models with BIC, and characterise DNA transport populations '
-    'without changing the original measurements.</div>',
-    unsafe_allow_html=True
-)
+st.title("Nanopore Analysis")
 
 with st.sidebar:
-    st.markdown("### Data sources")
-    st.caption("Only the dataset is required for clustering.")
-    f_dataset = st.file_uploader("Dataset · required", type=["npz"], key="np_dataset")
-    with st.expander("Optional companion files", expanded=False):
-        f_event = st.file_uploader("Event data · optional", type=["npz"], key="np_event")
-        f_fitting = st.file_uploader("Event fitting · optional", type=["npz"], key="np_fitting")
-        st.caption("Event data enables original-ID mapping and synchronized exports. "
-                   "Event fitting enables segment and topology analysis.")
-    unit = st.selectbox("Stored dwell-time unit", ["s", "ms", "us"], index=0,
-                        format_func=lambda u: {"s":"Seconds (NanoSense default)",
-                                               "ms":"Milliseconds", "us":"Microseconds"}[u])
+    st.markdown("### Data")
+    uploaded_dataset = st.file_uploader("Dataset · required", type="npz",
+                                       key="dataset_upload")
+    with st.expander("Optional companion files"):
+        uploaded_event = st.file_uploader("Event data", type="npz", key="event_upload")
+        uploaded_fitting = st.file_uploader("Event fitting", type="npz", key="fitting_upload")
+    dwell_unit = st.selectbox("Dwell-time unit in dataset", ["s", "ms", "us"],
+                              format_func=lambda u: {"s":"Seconds", "ms":"Milliseconds",
+                                                     "us":"Microseconds"}[u])
     st.divider()
-    st.caption(f"Nanopore Studio · v{VERSION}")
-    st.caption("Files are processed by the Streamlit server hosting this app. Source files are not modified.")
+    st.markdown("### GMM settings")
+    max_k = st.slider("Maximum K", 2, 10, 6)
+    st.caption("Full covariance · 10 initializations · random seed 0")
+    st.caption("v2.1 · Scientific edition")
 
-if f_dataset is None:
-    st.markdown('<div class="np-rule"></div>', unsafe_allow_html=True)
-    st.info("Upload a NanoSense dataset.npz to begin. The other two files are optional.")
-    st.markdown("**The streamlined workflow**")
-    st.write("Inspect your data → compare candidate K with BIC → select and "
-             "characterise clusters → optionally reclassify segment topology → export.")
+if uploaded_dataset is None:
+    st.info("Upload a dataset.npz file to begin.")
     st.stop()
 
-dataset_bytes = f_dataset.getvalue()
-event_bytes = f_event.getvalue() if f_event else None
-fitting_bytes = f_fitting.getvalue() if f_fitting else None
-source_id = hashlib.sha256(
-    dataset_bytes + unit.encode() + (event_bytes or b"") + (fitting_bytes or b"")
-).hexdigest()
+dataset_bytes = uploaded_dataset.getvalue()
+event_bytes = uploaded_event.getvalue() if uploaded_event else None
+fitting_bytes = uploaded_fitting.getvalue() if uploaded_fitting else None
 
 try:
-    with st.spinner("Reading and validating the dataset…"):
-        data = load_cached(dataset_bytes, event_bytes, fitting_bytes, unit)
+    data = cached_load(dataset_bytes, event_bytes, fitting_bytes, dwell_unit)
 except Exception as exc:
-    st.error(f"Unable to load these sources: {exc}")
+    st.error(f"Data loading failed: {exc}")
     st.stop()
 
-n_total = len(data["dwell_ms"])
-n_valid = int(data["valid"].sum())
-n_excluded = n_total - n_valid
+with st.sidebar:
+    sources = ["Dataset ΔI"]
+    if fitting_bytes is not None:
+        sources += ["Peak segment ΔI", "Time-weighted segment ΔI"]
+    feature_source = st.selectbox("ΔI source", sources)
+    feature_column = 0
+    if feature_source == "Dataset ΔI":
+        columns = [j for j in range(data["X"].shape[1]) if j != 4]
+        feature_column = st.selectbox("Dataset column", columns,
+                                      format_func=lambda j: "X[:,0] · ΔI" if j == 0
+                                      else f"X[:,{j}]")
+    try:
+        delta, delta_label = get_feature(data, feature_source, feature_column)
+    except Exception as exc:
+        st.error(str(exc))
+        st.stop()
+    if feature_source == "Dataset ΔI" and feature_column != 0:
+        st.caption("Verify the physical units of the selected column.")
 
-if st.session_state.get("np_source_id") != source_id:
-    st.session_state["np_source_id"] = source_id
-    st.session_state.pop("np_fit", None)
-    st.session_state.pop("np_export", None)
-    st.session_state.pop("np_selected_k", None)
+data["delta_label"] = delta_label
+valid_mask = (np.isfinite(data["dwell_ms"]) & (data["dwell_ms"] > 0) &
+              np.isfinite(delta))
+n_total = len(delta)
+n_valid = int(valid_mask.sum())
+n_bad = n_total - n_valid
+source_hash = hashlib.sha256(
+    dataset_bytes + (event_bytes or b"") + (fitting_bytes or b"") +
+    dwell_unit.encode() + feature_source.encode() + str(feature_column).encode()
+).hexdigest()
 
-# All controls are separate from source data and statistical model parameters.
-st.markdown('<div class="np-rule"></div>', unsafe_allow_html=True)
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Detected events", f"{n_total:,}")
-m2.metric("Valid for GMM", f"{n_valid:,}")
-m3.metric("Excluded from 2D", f"{n_excluded:,}")
-m4.metric("Companion files", f"{int(event_bytes is not None)+int(fitting_bytes is not None)} / 2")
+if st.session_state.get("analysis_source") != source_hash:
+    st.session_state["analysis_source"] = source_hash
+    st.session_state.pop("analysis_fit", None)
+    st.session_state.pop("analysis_selected_k", None)
+    st.session_state.pop("analysis_export", None)
 
-if n_excluded:
-    st.warning(f"{n_excluded:,} events have non-finite ΔI, invalid dwell time, or "
-               "non-positive dwell. They remain in the source data and will be "
-               "recorded in the export; they are not assigned to a GMM cluster.")
+st.caption(uploaded_dataset.name)
+m1, m2, m3 = st.columns(3)
+m1.metric("Total events", f"{n_total:,}")
+m2.metric("Valid 2D events", f"{n_valid:,}")
+m3.metric("Excluded", f"{n_bad:,}")
+if n_bad:
+    st.warning(f"{n_bad:,} events cannot be fitted because dwell time or ΔI is invalid. "
+               "Their original rows will be retained in the export log.")
 
-tabs = st.tabs(["01  Data", "02  Model selection", "03  Populations",
-                "04  Topology", "05  Export"])
+with st.sidebar:
+    fit_clicked = st.button("Fit GMM models", type="primary",
+                            disabled=n_valid < 20, use_container_width=True)
 
-# ── DATA ──────────────────────────────────────────────────────
-with tabs[0]:
-    st.subheader("Dataset overview")
-    st.caption("Inspect the original measurements before fitting a model.")
-    with st.expander("Source validation and column mapping"):
-        for note in data["notes"]:
-            st.write("✓", note)
-        st.write(f"X shape: {data['X'].shape}; dwell input unit: {unit}.")
-        st.write("The default feature mapping is X[:,4] for dwell and X[:,0] for ΔI.")
-        st.caption("Only load NPZ files from trusted sources because NanoSense "
-                   "archives may contain Python object arrays.")
-    a, b = st.columns([1.1, 2.2], gap="large")
-    with a:
-        st.markdown("#### Raw distributions")
-        metric = st.selectbox("Histogram variable", ["Dwell time", "ΔI"],
-                              key="raw_metric")
-        values = data["dwell_ms"] if metric == "Dwell time" else data["delta_i"]
-        values = values[data["valid"]]
-        fig, ax = new_figure((5.8, 4.1))
-        ax.hist(values, bins=70, color="#3CB8AE", alpha=.85, edgecolor="none")
-        ax.set_xlabel("Dwell time (ms)" if metric == "Dwell time" else "ΔI (nA)")
-        ax.set_ylabel("Number of events")
-        ax.set_title("All valid events")
-        fig.tight_layout()
-        render_figure(fig)
-        st.caption(f"Median dwell: {fmt(np.median(data['dwell_ms'][data['valid']]),4)} ms")
-    with b:
-        st.markdown("#### Dwell–blockade landscape")
-        c1, c2 = st.columns(2)
-        with c1:
-            density_log = st.toggle("Logarithmic dwell axis", value=False)
-        with c2:
-            density_smooth = st.slider("KDE smoothing", .5, 2.0, 1.0, .1)
-        plot_density(data["dwell_ms"], data["delta_i"], density_log, density_smooth)
+if fit_clicked:
+    try:
+        with st.spinner("Fitting candidate models…"):
+            bic = cached_fit(data["dwell_ms"], delta, max_k)
+        st.session_state["analysis_fit"] = (source_hash, max_k, bic)
+        st.session_state["analysis_selected_k"] = int(bic["best_k"])
+        st.session_state.pop("analysis_export", None)
+    except Exception as exc:
+        st.error(f"GMM fitting failed: {exc}")
 
-# ── MODEL SELECTION ───────────────────────────────────────────
-with tabs[1]:
-    st.subheader("BIC-guided model selection")
-    st.caption("Fit independent full-covariance GMMs to standardized "
-               "[log₁₀(dwell ms), ΔI]. No forced two-component analysis.")
-    with st.form("fit_form"):
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            max_k = st.slider("Maximum K to test", 2, 10, 6)
-        with c2:
-            st.markdown("**Fixed fitting settings**")
-            st.caption("Full covariance · 10 initializations · random state 0 · "
-                       "regularization 10⁻⁶. The same settings are used for every K.")
-        run_fit = st.form_submit_button("Fit and compare models", type="primary",
-                                        disabled=n_valid < 20)
-    if run_fit:
-        try:
-            with st.spinner("Fitting candidate Gaussian mixtures…"):
-                fitted = fit_cached(data["dwell_ms"], data["delta_i"], max_k)
-            st.session_state["np_fit"] = {"source": source_id, "fit": fitted}
-            st.session_state.pop("np_selected_k", None)
-            st.session_state.pop("np_export", None)
-        except Exception as exc:
-            st.error(f"Model fitting failed: {exc}")
+fit_state = st.session_state.get("analysis_fit")
+has_fit = bool(fit_state and fit_state[0] == source_hash and fit_state[1] == max_k)
+bic = fit_state[2] if has_fit else None
+result = None
+selected_k = None
+if has_fit:
+    tested = [int(k) for k in bic["table"]["Components (K)"]]
+    if st.session_state.get("analysis_selected_k") not in tested:
+        st.session_state["analysis_selected_k"] = int(bic["best_k"])
+    with st.sidebar:
+        selected_k = st.selectbox("Selected K", tested,
+                                  key="analysis_selected_k",
+                                  format_func=lambda k: f"{k}" +
+                                  (" · BIC minimum" if k == bic["best_k"] else ""))
+    result = build_bic_selected_population_result(
+        bic, data["dwell_ms"], delta, selected_k=selected_k
+    )
 
-    fit_state = st.session_state.get("np_fit")
-    if fit_state and fit_state["source"] == source_id:
-        bic = fit_state["fit"]
+tab_data, tab_model, tab_export = st.tabs(["Data", "BIC & populations", "Export"])
+
+with tab_data:
+    st.subheader("Data overview")
+    plot_type = st.selectbox("Plot", ["Dwell distribution", "ΔI distribution", "2D density"],
+                             key="overview_type", label_visibility="collapsed")
+    log_x = st.checkbox("Logarithmic dwell axis", value=True,
+                        key="overview_log") if plot_type != "ΔI distribution" else False
+    if plot_type == "2D density":
+        bandwidth = st.slider("KDE bandwidth", .5, 2., 1., .1, key="overview_bw")
+        spec = figure_editor("overview_2d", "Event density",
+                             "Dwell time (ms)", delta_label, log_x)
+        if n_valid >= 5:
+            try:
+                fig = density_plot(data, delta, spec, log_x, bandwidth)
+                show_figure(fig, "event_density")
+            except Exception as exc:
+                st.warning(f"Density calculation unavailable: {exc}")
+    else:
+        metric = "Dwell time" if plot_type == "Dwell distribution" else "ΔI"
+        values = data["dwell_ms"][valid_mask] if metric == "Dwell time" else delta[valid_mask]
+        mode = st.selectbox("Y-axis", ["Count", "Density"], key="overview_mode")
+        bins = st.slider("Number of bins", 10, 200, 70, 5, key="overview_bins")
+        if len(values):
+            edges = np.histogram_bin_edges(
+                np.log10(values) if log_x else values, bins=bins
+            )
+            if log_x:
+                edges = 10**edges
+            spec = figure_editor("overview_hist", plot_type,
+                                 "Dwell time (ms)" if metric == "Dwell time" else delta_label,
+                                 "Number of events" if mode == "Count" else "Probability density",
+                                 log_x)
+            # Use the original valid parent population, not an arbitrary cutoff.
+            overview_result = {"valid_idx": np.flatnonzero(valid_mask),
+                               "cluster_indices": [], "labels": np.full(n_total, -1)}
+            fig = histogram_plot(data, overview_result, delta, metric, [-1], mode,
+                                 edges, spec, log_x)
+            show_figure(fig, "data_distribution")
+    with st.expander("Data validation"):
+        st.write(f"Dataset shape: {data['X'].shape}")
+        st.write(f"Feature: {delta_label}; dwell input unit: {dwell_unit}.")
+        st.write(f"Companion files: event data {'loaded' if event_bytes else 'not loaded'}, "
+                 f"event fitting {'loaded' if fitting_bytes else 'not loaded'}.")
+        st.caption("Only open trusted NanoSense archives; NPZ object arrays require pickle loading.")
+
+with tab_model:
+    if not has_fit:
+        st.info("Select the input files and click Fit GMM models.")
+    else:
         best_k = int(bic["best_k"])
-        tested = [int(k) for k in bic["table"]["Components (K)"]]
-        if st.session_state.get("np_selected_k") not in tested:
-            st.session_state["np_selected_k"] = best_k
-        selected_k = st.selectbox(
-            "K to use for population analysis", tested,
-            format_func=lambda k: f"K = {k}" + (" · BIC minimum" if k == best_k else ""),
-            key="np_selected_k"
-        )
-        selected_k = int(selected_k)
-        result = build_bic_selected_population_result(
-            bic, data["dwell_ms"], data["delta_i"], selected_k=selected_k
-        )
-        selected_bic = float(bic["table"].loc[
-            bic["table"]["Components (K)"] == selected_k, "BIC"].iloc[0])
-        delta_bic = selected_bic - float(bic["table"]["BIC"].min())
-        x1, x2, x3 = st.columns(3)
-        x1.metric("BIC-preferred K", str(best_k))
-        x2.metric("Selected K", str(selected_k))
-        x3.metric("ΔBIC from minimum", f"{delta_bic:.1f}")
+        table = bic["table"].copy()
+        chosen_bic = float(table.loc[table["Components (K)"] == selected_k, "BIC"].iloc[0])
+        minimum = float(table["BIC"].min())
+        a, b, c = st.columns(3)
+        a.metric("BIC minimum", f"K = {best_k}")
+        b.metric("Selected model", f"K = {selected_k}")
+        c.metric("ΔBIC", f"{chosen_bic-minimum:.1f}")
         if best_k == max(tested):
-            st.warning("The lowest BIC occurs at the largest K tested. "
-                       "The exact preferred component count is not established; "
-                       "test a wider range if scientifically appropriate.")
-        if selected_k != best_k:
-            st.info("You selected a different K from the BIC minimum. "
-                    "Both values will be recorded in the export.")
-        bic_table = bic["table"].copy()
-        bic_table["Converged"] = [bic["models"][k].converged_ for k in tested]
-        bic_table["EM iterations"] = [bic["models"][k].n_iter_ for k in tested]
-        left, right = st.columns([1.1, 1], gap="large")
+            st.warning("The BIC minimum is at the largest K tested. A wider candidate range "
+                       "may be needed before interpreting the preferred component count.")
+        if not all(model.converged_ for model in bic["models"].values()):
+            st.warning("At least one candidate fit did not converge. Review the fit before "
+                       "using its BIC for model selection.")
+        left, right = st.columns([1.15, 1], gap="large")
         with left:
-            plot_bic(bic_table, best_k, selected_k)
+            spec = figure_editor("bic_figure", "BIC model selection",
+                                 "Number of Gaussian components, K", "BIC")
+            fig = bic_plot(table, best_k, selected_k, spec)
+            show_figure(fig, "bic_model_selection")
         with right:
             st.markdown("#### Candidate models")
-            st.dataframe(bic_table.style.format(
-                {"BIC": "{:.1f}", "ΔBIC from best": "{:.1f}"}
+            display_table = table.copy()
+            display_table["Converged"] = [bic["models"][k].converged_ for k in tested]
+            display_table["Iterations"] = [bic["models"][k].n_iter_ for k in tested]
+            st.dataframe(display_table.style.format(
+                {"BIC":"{:.1f}", "ΔBIC from best":"{:.1f}"}
             ), hide_index=True, use_container_width=True)
-            if not bic_table["Converged"].all():
-                st.warning("One or more fits did not converge. Treat the affected "
-                           "BIC values cautiously and consider reviewing the fit.")
-        with st.expander("How to interpret BIC"):
-            st.write("BIC balances model likelihood against the number of fitted "
-                     "parameters. Lower BIC is preferred among the candidate models.")
-            st.latex(r"\mathrm{BIC}=-2\ln L+p\ln N")
-            st.caption("A Gaussian component is a statistical description, not "
-                       "automatically a separate DNA transport mechanism.")
-    else:
-        st.info("Run the BIC comparison to unlock population analysis and export.")
-
-# Shared selected result — no additional GMM refitting on a K selection.
-fit_state = st.session_state.get("np_fit")
-has_fit = bool(fit_state and fit_state["source"] == source_id)
-if has_fit:
-    bic = fit_state["fit"]
-    chosen_k = int(st.session_state.get("np_selected_k", bic["best_k"]))
-    result = build_bic_selected_population_result(
-        bic, data["dwell_ms"], data["delta_i"], selected_k=chosen_k
-    )
-    cluster_table = descriptive_table(result, data["dwell_ms"], data["delta_i"])
-else:
-    bic = result = cluster_table = None
-
-# ── POPULATIONS ───────────────────────────────────────────────
-with tabs[2]:
-    st.subheader("Population characterisation")
-    if not has_fit:
-        st.info("Fit the candidate models in Model selection first.")
-    else:
-        st.caption("Clusters are ordered by median original dwell time. Means are "
-                   "calculated from hard-assigned raw events, not GMM centres.")
-        display_cluster_table(cluster_table)
-        st.download_button("Download cluster summary · CSV",
-                           cluster_table.to_csv(index=False),
-                           "cluster_summary.csv", "text/csv")
+            st.caption("Lower BIC is preferred among the tested models.")
+        st.divider()
+        st.subheader("Population summary")
+        summary = describe(result, data["dwell_ms"], delta)
+        st.dataframe(summary.style.format({
+            "% of valid events":"{:.1f}",
+            "Median dwell (ms)":"{:.4f}",
+            "Mean dwell (ms)":"{:.4f}",
+            "Mean ΔI (nA)":"{:.4f}",
+        }), hide_index=True, use_container_width=True)
         p = result["assignment_probability"]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Median assignment confidence", f"{100*np.median(p):.1f}%")
-        c2.metric("Assignments below 70%", f"{100*np.mean(p < .70):.1f}%")
-        c3.metric("Number of populations", str(result["n_components"]))
-        st.markdown("#### Population map")
-        c1, c2 = st.columns(2)
-        with c1:
-            plot_log = st.toggle("Logarithmic dwell axis", key="cluster_log")
-        with c2:
-            boundary = st.toggle("Show model boundaries", value=True)
-        plot_clusters(data, result, plot_log, boundary)
-        st.markdown("#### Compare distributions")
-        h1, h2, h3 = st.columns(3)
-        with h1:
-            hist_metric = st.selectbox("Variable", ["Dwell time", "ΔI"], key="cluster_metric")
-        with h2:
-            hist_mode = st.selectbox("Y-axis", ["Count", "Density · each cluster",
-                                                "Share of all events"])
-        with h3:
-            n_bins = st.slider("Common bin count", 20, 150, 70, 5)
-        selected_clusters = st.multiselect(
-            "Populations to display",
-            options=list(range(result["n_components"])),
-            default=list(range(result["n_components"])),
-            format_func=lambda k: f"Cluster {k+1}",
-        )
-        if selected_clusters:
-            plot_histogram(data, result, hist_metric, hist_mode, n_bins, selected_clusters)
-        st.caption("All curves use the same bin edges. Density normalizes each "
-                   "population separately; count and share preserve abundance.")
-
-# ── TOPOLOGY ──────────────────────────────────────────────────
-topology_table = None
-effective_counts = None
-topology_threshold = None
-with tabs[3]:
-    st.subheader("Optional segment-topology reclassification")
-    if not has_fit:
-        st.info("Fit a GMM before characterising its clusters.")
-    elif fitting_bytes is None:
-        st.info("Upload the optional event_fitting.npz in the sidebar to enable "
-                "segment and topology analysis. Clustering and other exports remain available.")
-    else:
-        st.caption("Post-clustering sensitivity analysis. The GMM assignments stay "
-                   "fixed while the similarity threshold changes.")
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            enable_topology = st.toggle("Enable reclassification", value=False)
-        with c2:
-            st.caption("Adjacent fitted segment amplitudes are merged when their "
-                       "similarity reaches the selected threshold.")
-        if enable_topology:
-            topology_threshold = st.slider(
-                "Adjacent-segment amplitude similarity threshold (%)",
-                0.0, 100.0, 80.0, 1.0, format="%.0f%%"
+        st.caption(f"Median posterior assignment probability: {100*np.median(p):.1f}%"
+                   f"  ·  Below 70%: {100*np.mean(p < .7):.1f}%")
+        st.download_button("Download summary CSV", summary.to_csv(index=False),
+                           "cluster_summary.csv", "text/csv")
+        st.divider()
+        st.subheader("Population plots")
+        plot_kind = st.selectbox("Plot", [
+            "GMM classification", "Dwell distribution", "ΔI distribution",
+            "Dwell KDE", "ΔI KDE", "2D density"
+        ], key="population_plot", label_visibility="collapsed")
+        is_dwell = "Dwell" in plot_kind or plot_kind in ("GMM classification", "2D density")
+        log_plot = st.checkbox("Logarithmic dwell axis", True,
+                               key="population_log") if is_dwell else False
+        selection = []
+        if plot_kind not in ("GMM classification", "2D density"):
+            choices = [-1] + list(range(result["n_components"]))
+            selection = st.multiselect(
+                "Populations", choices, default=list(range(result["n_components"])),
+                format_func=lambda k: "All events" if k == -1 else f"Cluster {k+1}",
+                key="population_selection"
             )
-            st.latex(r"S(a,b)=100\frac{\min(|a|,|b|)}{\max(|a|,|b|)}")
-            st.caption("100% means identical blockade magnitudes. Merged levels are "
-                       "duration-weighted when widths are available. This reproduces "
-                       "the exploratory v1.4.8 rule; it is not a NanoSense-native "
-                       "threshold unless independently verified.")
-            with st.spinner("Reclassifying segment sequences…"):
-                derived = metrics_cached(fitting_bytes, n_total)
-                original_counts = derived["Number of segments"]
-                effective_counts = topology_cached(
-                    fitting_bytes, n_total, topology_threshold
-                )
-                topology_table = topology_statistics(
-                    result, original_counts, effective_counts
-                )
-            display_topology_table(topology_table)
-            st.download_button("Download topology summary · CSV",
-                               topology_table.to_csv(index=False),
-                               "topology_summary.csv", "text/csv")
-            plot_topology(topology_table)
-            with st.expander("Definitions and limitations"):
-                st.write("One effective segment is linear-like; two are folded-like; "
-                         "three or more are complex. These are segment-derived, "
-                         "putative classes rather than confirmed molecular conformations.")
-                st.write("Percentages use only events with usable segment information. "
-                         "Missing values are reported separately. Longer events may "
-                         "offer more opportunity for a segmentation algorithm to find "
-                         "multiple levels, so this is supporting evidence, not "
-                         "independent proof of a physical mechanism.")
-                st.write("The similarity rule is applied after the original NanoSense "
-                         "segmentation. It does not refit the current trace or modify "
-                         "the original NPZ files.")
+        if plot_kind == "GMM classification":
+            c1, c2 = st.columns(2)
+            with c1:
+                boundary = st.checkbox("Model boundaries", True)
+            with c2:
+                point_size = st.slider("Point size", 2, 25, 8)
+            spec = figure_editor("classification", "GMM population classification",
+                                 "Dwell time (ms)", delta_label, log_plot)
+            fig = scatter_plot(data, result, delta, spec, log_plot, boundary, point_size)
+            show_figure(fig, "gmm_classification")
+        elif plot_kind == "2D density":
+            bw = st.slider("KDE bandwidth", .5, 2., 1., .1, key="population_bw")
+            spec = figure_editor("population_density", "Event density",
+                                 "Dwell time (ms)", delta_label, log_plot)
+            try:
+                fig = density_plot(data, delta, spec, log_plot, bw)
+                show_figure(fig, "population_density")
+            except Exception as exc:
+                st.warning(f"Density calculation unavailable: {exc}")
+        elif selection:
+            metric = "Dwell time" if "Dwell" in plot_kind else "ΔI"
+            xlabel = "Dwell time (ms)" if metric == "Dwell time" else delta_label
+            if "KDE" in plot_kind:
+                bw = st.slider("KDE bandwidth", .5, 2., 1., .1, key="cluster_bw")
+                spec = figure_editor("cluster_kde", f"{metric} density",
+                                     xlabel, "Probability density", log_plot)
+                fig = kde_plot(data, result, delta, metric, selection, spec, log_plot, bw)
+            else:
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    mode = st.selectbox("Y-axis", ["Count", "Density", "Share of all events"],
+                                        key="cluster_hist_mode")
+                with c2:
+                    bins = st.slider("Bins", 10, 250, 70, 5, key="cluster_bins")
+                with c3:
+                    style = st.selectbox("Style", ["Step", "Filled"], key="hist_style")
+                with st.expander("Bin and range controls"):
+                    bin_method = st.selectbox("Bin spacing", ["Automatic", "Fixed width"],
+                                              key="bin_method")
+                    manual_width = None
+                    if bin_method == "Fixed width":
+                        manual_width = st.number_input("Bin width (original units)",
+                                                       min_value=1e-9, value=.005,
+                                                       format="%.6f")
+                    trim = st.checkbox("Set histogram range", False)
+                    lower = upper = None
+                    if trim:
+                        lower = st.number_input("Range minimum", value=0., format="%.6f")
+                        upper = st.number_input("Range maximum", value=1., format="%.6f")
+                parent = data["dwell_ms"] if metric == "Dwell time" else delta
+                parent = parent[result["valid_idx"]]
+                parent = parent[np.isfinite(parent) & ((parent > 0) if log_plot else True)]
+                if len(parent):
+                    lo, hi = float(np.min(parent)), float(np.max(parent))
+                    if trim:
+                        if lower >= upper or (log_plot and lower <= 0):
+                            st.warning("Invalid histogram range; using the full range.")
+                        else:
+                            lo, hi = float(lower), float(upper)
+                    if hi <= lo:
+                        hi = lo + max(abs(lo)*1e-6, 1e-9)
+                    if manual_width:
+                        if (hi-lo)/manual_width > 10000:
+                            st.warning("Too many bins; increase the width or narrow the range.")
+                            manual_width = (hi-lo)/10000
+                        edges = np.arange(lo, hi+manual_width, manual_width)
+                        if len(edges) < 2:
+                            edges = np.array([lo, hi])
+                    elif log_plot:
+                        edges = np.geomspace(lo, hi, bins+1)
+                    else:
+                        edges = np.linspace(lo, hi, bins+1)
+                    ylabel = {"Count":"Number of events", "Density":"Probability density",
+                              "Share of all events":"Fraction of valid events per bin"}[mode]
+                    spec = figure_editor("cluster_hist", f"{metric} distribution",
+                                         xlabel, ylabel, log_plot)
+                    fig = histogram_plot(data, result, delta, metric, selection,
+                                         mode, edges, spec, log_plot, style)
+                else:
+                    fig = None
+            if fig is not None:
+                show_figure(fig, safe_name(plot_kind.lower().replace(" ", "_")))
+        if plot_kind not in ("GMM classification", "2D density"):
+            st.caption("Common bin edges are used across populations. Density normalizes "
+                       "each cluster separately; counts and event shares preserve abundance.")
 
-# ── EXPORT ────────────────────────────────────────────────────
-with tabs[4]:
-    st.subheader("Export analysis and synchronized populations")
+with tab_export:
+    st.subheader("Export")
     if not has_fit:
-        st.info("Run a GMM analysis to enable export.")
+        st.info("Fit and select a GMM model before exporting.")
     else:
-        st.caption("All original rows are traceable. Invalid 2D events are logged, "
-                   "and only uploaded source types are included in each cluster folder.")
-        st.markdown("#### Included in the analysis package")
-        st.write("Cluster summary, full event-to-cluster mapping, posterior "
-                 "probabilities, BIC table, model settings, and excluded-event log.")
-        if topology_table is not None:
-            st.write("The current topology reclassification table and threshold "
-                     "will also be included.")
-        sources = ["dataset"]
-        if event_bytes is not None:
-            sources.append("event_data")
-        if fitting_bytes is not None:
-            sources.append("event_fitting")
-        st.markdown("**Available NPZ source types:** " + ", ".join(sources))
-        stem = safe_stem(f_dataset.name)
-        if st.button("Build analysis package", type="primary"):
-            with st.spinner("Building synchronized cluster files…"):
-                try:
-                    zip_bytes = export_bundle(
-                        data, bic, result, topology_table, effective_counts,
-                        topology_threshold, stem
-                    )
-                    st.session_state["np_export"] = {
-                        "source": source_id,
-                        "K": chosen_k,
-                        "threshold": topology_threshold,
-                        "bytes": zip_bytes
-                    }
-                except Exception as exc:
-                    st.error(f"Export failed: {exc}")
-        export_state = st.session_state.get("np_export")
-        if export_state and export_state["source"] == source_id \
-                and export_state["K"] == chosen_k \
-                and export_state["threshold"] == topology_threshold:
-            st.success("Analysis package is ready.")
-            st.download_button(
-                "Download analysis + clusters · ZIP",
-                export_state["bytes"],
-                file_name=f"{stem}_GMM_K{chosen_k}_analysis.zip",
-                mime="application/zip", type="primary"
-            )
-        elif export_state and export_state["source"] == source_id:
-            st.caption("The selection has changed. Build the package again to "
-                       "include the current K and topology settings.")
-        with st.expander("Export compatibility"):
-            st.write("Dataset-only exports contain filtered dataset.npz files and "
-                     "original-row mapping. If event_data and/or event_fitting were "
-                     "uploaded, their corresponding synchronized, reindexed NPZ files "
-                     "are included too. A complete three-file export retains the "
-                     "original NanoSense source structure.")
-            st.write("The source archives are never overwritten. Original IDs and "
-                     "row indices are retained in event_id_mapping.csv.")
+        st.write(f"Selected K: **{selected_k}** · Valid events: **{n_valid:,}**")
+        st.caption("The package includes the BIC table, cluster statistics, event mapping, "
+                   "posterior probabilities, and available synchronized NPZ files.")
+        if n_bad:
+            st.checkbox("Exclude invalid 2D events from cluster files and record them "
+                        "in excluded_events.csv", key="confirm_exclusions")
+        ready = n_bad == 0 or st.session_state.get("confirm_exclusions", False)
+        if st.button("Build export ZIP", type="primary", disabled=not ready):
+            try:
+                with st.spinner("Building cluster files…"):
+                    stem = safe_name(uploaded_dataset.name.replace(".dataset.npz", "")
+                                     .replace(".npz", ""))
+                    payload = export_results(data, bic, result, delta, delta_label, stem)
+                st.session_state["analysis_export"] = {
+                    "source": source_hash, "K": selected_k, "payload": payload,
+                    "name": f"{stem}_GMM_K{selected_k}.zip"
+                }
+            except Exception as exc:
+                st.error(f"Export failed: {exc}")
+        saved = st.session_state.get("analysis_export")
+        if saved and saved["source"] == source_hash and saved["K"] == selected_k:
+            st.download_button("Download analysis ZIP", saved["payload"],
+                               saved["name"], "application/zip", type="primary")
+        elif saved:
+            st.caption("The model selection changed. Rebuild the export to update it.")
